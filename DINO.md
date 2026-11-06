@@ -9,7 +9,8 @@ External pretrained weights remain an unresolved course-rule question.
 Training uses two 96×96 global crops and six 48×48 local crops, ImageNet
 normalization, AdamW, learning-rate warmup and cosine decay. Labels are removed
 before sampling training examples. The parquet file must already exist locally;
-the training script does not download data or weights. Logs stay local.
+the training script does not download data or weights. CSV logs stay local;
+Weights & Biases logging is available with `--wandb`.
 
 Install the locked environment and check the full pipeline:
 
@@ -33,12 +34,41 @@ The default uses one available device with full precision. Lower the batch size
 if memory is limited. The initial learning rate is 0.0005; tune it alongside
 batch size. Use a new output directory for each independent experiment.
 
+## Weights & Biases
+
+Authenticate once, then enable W&B logging:
+
+```bash
+uv run wandb login
+uv run main.py --wandb --wandb-project dino-experiment --wandb-name vit-tiny8-run1
+```
+
+Use `--wandb-entity YOUR_TEAM` to choose a team or account. W&B receives the
+step/epoch training loss, learning rate, epoch/step counters, model
+hyperparameters, batch size, crop settings, seed, and precision. Local CSV
+logging continues alongside W&B. Checkpoints, image data, and the ONNX model
+are not uploaded by this integration.
+
+Check W&B logging without logging in or contacting W&B:
+
+```bash
+uv run main.py --smoke-test --wandb --wandb-mode offline --output runs/dino-wandb-smoke
+```
+
+Offline run files are saved under the output directory's `wandb/` folder.
+Training without `--wandb` uses only local CSV logging, which is suitable for
+offline reproduction. Export-only commands do not create W&B runs.
+
 Resume with the same training settings and output directory:
 
 ```bash
 uv run main.py --epochs 100 --batch-size 64 --output runs/dino \
   --resume runs/dino/checkpoints/last.ckpt
 ```
+
+To continue the same online W&B run, also pass `--wandb --wandb-id RUN_ID`
+and the same W&B project/entity. The run ID appears in W&B's run URL; the
+display name is not the run ID. Without an ID, W&B starts a new run.
 
 Export again without training:
 

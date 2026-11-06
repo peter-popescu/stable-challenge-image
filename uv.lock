@@ -3511,6 +3511,7 @@ baseline = [
     { name = "lightning" },
     { name = "stable-pretraining" },
     { name = "timm" },
+    { name = "wandb" },
 ]
 dev = [
     { name = "pytest" },
@@ -3533,6 +3534,7 @@ baseline = [
     { name = "lightning", specifier = ">=2.5" },
     { name = "stable-pretraining", specifier = "==0.1.8" },
     { name = "timm", specifier = ">=1.0.30" },
+    { name = "wandb", specifier = ">=0.30.0" },
 ]
 dev = [{ name = "pytest" }]
 

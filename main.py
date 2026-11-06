@@ -8,7 +8,7 @@ import lightning as pl
 import stable_pretraining as spt
 import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from stable_pretraining.callbacks import TeacherStudentCallback
 from stable_pretraining.methods.dino import DINO
 from stable_pretraining.optim.lr_scheduler import LinearWarmupCosineAnnealing
@@ -144,6 +144,12 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu", "mps"], default="auto")
     parser.add_argument("--precision", default="32-true")
+    parser.add_argument("--wandb", action="store_true", help="Log metrics and configuration to Weights & Biases")
+    parser.add_argument("--wandb-project", default="dino-experiment")
+    parser.add_argument("--wandb-entity", help="W&B username or team (defaults to your account)")
+    parser.add_argument("--wandb-name", help="Display name for this training run")
+    parser.add_argument("--wandb-id", help="Existing W&B run ID to continue alongside --resume")
+    parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
     parser.add_argument("--resume", type=Path, help="Resume a trusted local training checkpoint")
     parser.add_argument("--export-checkpoint", type=Path, help="Export a trusted local checkpoint without training")
     parser.add_argument("--smoke-test", action="store_true", help="Two small CPU training steps, checkpoint, and ONNX export")
@@ -176,18 +182,44 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     checkpoint = ModelCheckpoint(dirpath=args.output / "checkpoints", save_last=True,
                                  save_top_k=0)
+    loggers = [CSVLogger(str(args.output), name="logs")]
+    wandb_logger = None
+    if args.wandb:
+        wandb_logger = WandbLogger(
+            project=args.wandb_project, entity=args.wandb_entity,
+            name=args.wandb_name, id=args.wandb_id,
+            save_dir=str(args.output), mode=args.wandb_mode,
+            log_model=False,
+            config={
+                "encoder": "vit_tiny_patch8_depth10", "pretrained": False,
+                "batch_size": args.batch_size, "local_crops": args.local_crops,
+                "global_crop_size": 96, "local_crop_size": 48,
+                "seed": args.seed, "precision": args.precision,
+                "smoke_test": args.smoke_test,
+            },
+        )
+        loggers.append(wandb_logger)
     trainer = pl.Trainer(
         max_epochs=args.epochs, max_steps=2 if args.smoke_test else -1,
         accelerator=args.accelerator, devices=1, precision=args.precision,
-        deterministic=True, logger=CSVLogger(str(args.output), name="logs"),
+        deterministic=True, logger=loggers,
         callbacks=[TeacherStudentCallback(), checkpoint],
         log_every_n_steps=1 if args.smoke_test else 10,
         enable_model_summary=False,
     )
-    trainer.fit(model, train_dataloaders=loader,
-                ckpt_path=str(args.resume) if args.resume else None)
-    trainer.save_checkpoint(args.output / "checkpoints" / "last.ckpt")
-    export_teacher(model, args.output / "model.onnx")
+    exit_code = 1
+    try:
+        trainer.fit(model, train_dataloaders=loader,
+                    ckpt_path=str(args.resume) if args.resume else None)
+        trainer.save_checkpoint(args.output / "checkpoints" / "last.ckpt")
+        export_teacher(model, args.output / "model.onnx")
+        exit_code = 0
+    finally:
+        if wandb_logger is not None:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.finish(exit_code=exit_code)
 
 
 if __name__ == "__main__":

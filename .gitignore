@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+runs/
 
 # Data: only the small sample is tracked; the evaluation set must never be committed
 data/*

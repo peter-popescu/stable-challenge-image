@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-baseline = ["stable-pretraining", "kornia"]
+baseline = ["stable-pretraining==0.1.8", "kornia", "timm>=1.0.30", "lightning>=2.5"]
 dev = ["pytest"]
 
 [tool.uv]

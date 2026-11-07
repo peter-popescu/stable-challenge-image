@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 runs/
+dino-*.out
 
 # Data: only the small sample is tracked; the evaluation set must never be committed
 data/*

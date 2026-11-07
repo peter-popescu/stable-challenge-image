@@ -34,6 +34,60 @@ The default uses one available device with full precision. Lower the batch size
 if memory is limited. The initial learning rate is 0.0005; tune it alongside
 batch size. Use a new output directory for each independent experiment.
 
+## Oscar batch jobs
+
+Copy `dino.sbatch` to the project directory on Oscar. Submit from that directory
+after installing the environment and authenticating W&B:
+
+```bash
+uv sync --locked --python 3.12
+uv run wandb login
+sbatch dino.sbatch
+```
+
+The script requests one GPU of any type on the `gpu` partition, along with one
+node, one training task, and six CPU cores. Four cores are
+budgeted for the four data-loader workers; the main process uses up to two
+OpenMP/MKL threads. Workers are subprocesses of the single training task, not
+additional Slurm tasks. This is a CPU budget, not per-worker core pinning.
+`--ntasks-per-node=1` matches the trainer's `devices=1`.
+Training uses GPU acceleration and mixed precision.
+
+Follow progress with `tail -f dino-JOB_ID.out` and check the queue with
+`squeue -u "$USER"`. Outputs go to `runs/dino-JOB_ID/`.
+To change the epoch count or use offline W&B logging, append training options:
+
+```bash
+sbatch dino.sbatch --epochs 10 --wandb-mode offline
+```
+
+The default time limit is one hour, matching the tested interactive allocation.
+For a longer run, request more time, for example `sbatch --time=12:00:00 dino.sbatch`.
+
+### CUDA driver compatibility
+
+The lockfile selects official CUDA 12.6 builds of PyTorch 2.14.1 and torchvision
+0.29.1 on Linux x86-64. This avoids the default PyPI Linux CUDA 13 build, which
+fails on Oscar nodes whose NVIDIA driver reports CUDA 12.9 support. macOS
+continues to use PyPI builds. A CUDA toolkit module does not update the driver.
+
+After copying both the updated `pyproject.toml` and `uv.lock` to Oscar, run:
+
+```bash
+uv sync --locked --python 3.12
+```
+
+Inside a GPU allocation, check the installed build and initialize CUDA before
+starting training:
+
+```bash
+.venv/bin/python -c 'import torch; print(torch.__version__, torch.version.cuda); torch.cuda.init(); print(torch.cuda.get_device_name(0))'
+```
+
+The build should show `+cu126` and CUDA `12.6`. Actual GPU initialization must
+be checked on Oscar; resolving the lockfile alone does not verify the node's
+driver or GPU access.
+
 ## Weights & Biases
 
 Authenticate once, then enable W&B logging:

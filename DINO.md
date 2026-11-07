@@ -6,6 +6,25 @@ callback, and training loop. The encoder is a randomly initialized ViT with
 It is a starting baseline, not a tuned model or a pretrained DINOv2 model.
 External pretrained weights remain an unresolved course-rule question.
 
+New runs use a normalized prototype layer (fixed unit weight norms), truncated
+normal initialization for the projection head, and freeze the prototype layer
+during the first epoch. Biases and normalization parameters are excluded from
+AdamW weight decay. The stable-pretraining DINO method still handles view
+matching, teacher sharpening/centering, and student gradients; its EMA callback
+updates both the teacher encoder and head after optimizer steps. The loss center
+is included in checkpoints. This remains a compact DINO adaptation: fewer
+prototypes, smaller crops/head, epoch-based EMA scheduling, and constant weight
+decay differ from the original ImageNet recipe.
+
+When resuming an older checkpoint, its original head and freeze settings are
+preserved. Start a fresh run in a new output directory to use the revised head.
+
+The random seed is fixed (default 42). The trainer uses `deterministic="warn"`
+to prefer deterministic operations where available without aborting on the
+ViT positional-embedding resize, whose bicubic CUDA backward has no
+deterministic implementation. Training is not guaranteed to be bit-for-bit
+identical across runs or machines.
+
 Training uses two 96×96 global crops and six 48×48 local crops, ImageNet
 normalization, AdamW, learning-rate warmup and cosine decay. Labels are removed
 before sampling training examples. The parquet file must already exist locally;
@@ -61,8 +80,11 @@ To change the epoch count or use offline W&B logging, append training options:
 sbatch dino.sbatch --epochs 10 --wandb-mode offline
 ```
 
-The default time limit is one hour, matching the tested interactive allocation.
-For a longer run, request more time, for example `sbatch --time=12:00:00 dino.sbatch`.
+The default time limit is 12 hours for the 100-epoch training run, including
+periodic accuracy probes. This is a conservative initial allocation, not a
+measured runtime estimate; adjust after observing completed epoch times on your
+assigned GPU. An epoch-end checkpoint is saved throughout training. To request
+a different limit, for example, use `sbatch --time=06:00:00 dino.sbatch`.
 
 ### CUDA driver compatibility
 
@@ -102,6 +124,28 @@ step/epoch training loss, learning rate, epoch/step counters, model
 hyperparameters, batch size, crop settings, seed, and precision. Local CSV
 logging continues alongside W&B. Checkpoints, image data, and the ONNX model
 are not uploaded by this integration.
+
+### Accuracy monitoring
+
+The script logs `probe/loo_accuracy`, `probe/ridge_lambda`, labelled image/class
+counts, and probe duration. Accuracy ranges from 0 to 1.
+Monitoring runs after epoch 1, every 5 epochs,
+and at the final epoch. Set `--probe-every 1` for every epoch or
+`--probe-every 0` to disable it.
+
+Each monitoring pass exports a separate copy of the EMA encoder through the
+same ONNX path used for final submission, then calls `evaluate.py`'s `evaluate`
+function on CPU. It uses the evaluator's exact input normalization, feature
+standardization, regularization selection, and leave-one-out predictions on
+all labelled training images. Only ONNX Runtime's CPU thread count is bounded
+to the Slurm allocation (two threads outside Slurm). The temporary model is
+deleted after scoring. Monitoring preserves the training RNG and live encoder.
+
+The previous 80/20 metrics have been replaced, not renamed: this is a different
+calculation. This now matches the published local evaluation protocol; the
+organizers' hidden evaluation still uses different images/classes. Labels only
+enter the separate CPU ridge probe, never DINO's training objective. At least
+two labelled images are required. No classifier is exported in the submission.
 
 Check W&B logging without logging in or contacting W&B:
 

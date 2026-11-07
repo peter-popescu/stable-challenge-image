@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
-#SBATCH --time=01:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=dino-%j.out
 
 set -euo pipefail
@@ -36,6 +36,7 @@ srun .venv/bin/python main.py \
     --epochs 100 \
     --batch-size 64 \
     --workers "$workers" \
+    --probe-every 5 \
     --wandb \
     --wandb-project dino-experiment \
     --wandb-name "oscar-${SLURM_JOB_ID}" \

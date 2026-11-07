@@ -88,14 +88,14 @@ class Ridge:
         return self.classes[(((x - self.mu) / self.sd) @ self.W + self.ybar).argmax(1)]
 
 
-def evaluate(model_path, data="data/sample.parquet"):
+def evaluate(model_path, data="data/sample.parquet", threads=None):
     t0 = time.time()
     ds = Dataset.from_parquet(data)
     ds = ds.select(np.flatnonzero(np.asarray(ds["label"]) != UNLABELLED))
     if len(ds) < 2:
         raise RuntimeError(f"{data!r} has {len(ds)} labelled images; the probe needs at least 2")
     opts = ort.SessionOptions()
-    opts.intra_op_num_threads = os.cpu_count()
+    opts.intra_op_num_threads = threads if threads is not None else os.cpu_count()
     try:
         sess = ort.InferenceSession(
             model_path, opts, providers=["CPUExecutionProvider"]

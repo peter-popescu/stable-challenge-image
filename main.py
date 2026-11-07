@@ -1,7 +1,6 @@
 """Local DINO experiment using stable-pretraining; see DINO.md for commands."""
 
 import argparse
-import copy
 from pathlib import Path
 
 import lightning as pl
@@ -15,7 +14,9 @@ from stable_pretraining.optim.lr_scheduler import LinearWarmupCosineAnnealing
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 
-from export_onnx import MEAN, STD, export_onnx
+from export_onnx import MEAN, STD
+from probe import ChallengeProbe
+from submission import export_teacher
 from training_data import DEFAULT_PATH, load_training_data
 
 
@@ -67,10 +68,18 @@ def dino_schedule(optimizer, module):
     )
 
 
+class NormalizedPrototypes(torch.nn.Linear):
+    """Unit-norm prototype weights, equivalent to weight norm with fixed g=1."""
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, torch.nn.functional.normalize(self.weight, dim=1))
+
+
 class ChallengeDINO(DINO):
     """Adapt stable-pretraining's DINO method to its dictionary training loop."""
 
-    def __init__(self, epochs=100, lr=5e-4, weight_decay=0.04, n_prototypes=4096):
+    def __init__(self, epochs=100, lr=5e-4, weight_decay=0.04, n_prototypes=4096,
+                 normalize_prototypes=False, freeze_last_layer_epochs=0):
         super().__init__(
             encoder_name="vit_tiny_patch16_224",
             encoder_kwargs={
@@ -88,13 +97,26 @@ class ChallengeDINO(DINO):
         self.save_hyperparameters({
             "epochs": epochs, "lr": lr, "weight_decay": weight_decay,
             "n_prototypes": n_prototypes,
+            "normalize_prototypes": normalize_prototypes,
+            "freeze_last_layer_epochs": freeze_last_layer_epochs,
         })
+        # Defaults retain older checkpoint semantics; new runs enable both below.
+        if normalize_prototypes:
+            projector = self.projector.student
+            projector[-1] = NormalizedPrototypes(128, n_prototypes, bias=False)
+            for layer in projector.modules():
+                if isinstance(layer, torch.nn.Linear):
+                    torch.nn.init.trunc_normal_(layer.weight, std=0.02)
+                    if layer.bias is not None:
+                        torch.nn.init.zeros_(layer.bias)
+            self.projector = spt.TeacherStudentWrapper(projector)
         # In 0.1.8 the loss center is a plain attribute. Register it so device
         # transfers and checkpoints preserve this essential part of DINO state.
         del self.dino_loss.center
         self.dino_loss.register_buffer("center", torch.zeros(1, n_prototypes))
         self.optim = {
-            "optimizer": {"type": "AdamW", "lr": lr, "weight_decay": weight_decay},
+            "optimizer": {"type": "AdamW", "lr": lr, "weight_decay": weight_decay,
+                          "exclude_bias_norm": True},
             "scheduler": dino_schedule,
             "interval": "step",
             "gradient_clip_val": 3.0,
@@ -112,24 +134,11 @@ class ChallengeDINO(DINO):
                  prog_bar=True, batch_size=batch["global_views"][0].shape[0])
         return {"loss": output.loss, "embedding": output.embedding}
 
-
-def export_teacher(model, path):
-    """Export only the EMA encoder; training heads stay out of the submission."""
-    encoder = copy.deepcopy(model.backbone.teacher).cpu().eval()
-    # Fixed spatial size makes the submitted graph simpler. Batch stays dynamic.
-    encoder.dynamic_img_size = False
-    encoder.patch_embed.strict_img_size = True
-    encoder.patch_embed.output_fmt = "NCHW"
-    encoder.patch_embed.flatten = True
-    for block in encoder.blocks:
-        block.attn.fused_attn = False
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    export_onnx(encoder, str(path))
-    size = path.stat().st_size / 1024**2
-    if size > 20:
-        raise ValueError(f"ONNX file is {size:.2f} MiB; challenge limit is 20 MiB")
-    print(f"EMA teacher encoder: {size:.2f} MiB. Validate with test_submission.py.")
+    def after_manual_backward(self):
+        # stable-pretraining calls this before clipping and optimizer.step().
+        if self.current_epoch < self.hparams.freeze_last_layer_epochs:
+            for parameter in self.projector.student[-1].parameters():
+                parameter.grad = None
 
 
 def parse_args():
@@ -142,6 +151,8 @@ def parse_args():
     parser.add_argument("--local-crops", type=int, default=6)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--probe-every", type=int, default=5,
+                        help="Log challenge-protocol leave-one-out accuracy every N epochs; 0 disables")
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu", "mps"], default="auto")
     parser.add_argument("--precision", default="32-true")
     parser.add_argument("--wandb", action="store_true", help="Log metrics and configuration to Weights & Biases")
@@ -158,6 +169,8 @@ def parse_args():
         parser.error("epochs, batch-size and lr must be positive; workers and local-crops nonnegative")
     if args.resume and args.export_checkpoint:
         parser.error("choose either --resume or --export-checkpoint")
+    if args.probe_every < 0:
+        parser.error("probe-every must be nonnegative")
     return args
 
 
@@ -178,10 +191,18 @@ def main():
         raise ValueError("Dataset must contain at least one full batch; lower --batch-size")
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
                         num_workers=args.workers, persistent_workers=args.workers > 0)
-    model = ChallengeDINO(epochs=args.epochs, lr=args.lr)
+    if args.resume:
+        model = ChallengeDINO.load_from_checkpoint(str(args.resume), map_location="cpu")
+    else:
+        model = ChallengeDINO(epochs=args.epochs, lr=args.lr,
+                              normalize_prototypes=True, freeze_last_layer_epochs=1)
     args.output.mkdir(parents=True, exist_ok=True)
     checkpoint = ModelCheckpoint(dirpath=args.output / "checkpoints", save_last=True,
                                  save_top_k=0)
+    callbacks = [TeacherStudentCallback()]
+    if args.probe_every:
+        callbacks.append(ChallengeProbe(args.data, every_n_epochs=args.probe_every))
+    callbacks.append(checkpoint)
     loggers = [CSVLogger(str(args.output), name="logs")]
     wandb_logger = None
     if args.wandb:
@@ -196,14 +217,18 @@ def main():
                 "global_crop_size": 96, "local_crop_size": 48,
                 "seed": args.seed, "precision": args.precision,
                 "smoke_test": args.smoke_test,
+                "probe_every": args.probe_every, "probe_protocol": "onnx_cpu_ridge_loo",
             },
         )
         loggers.append(wandb_logger)
     trainer = pl.Trainer(
         max_epochs=args.epochs, max_steps=2 if args.smoke_test else -1,
         accelerator=args.accelerator, devices=1, precision=args.precision,
-        deterministic=True, logger=loggers,
-        callbacks=[TeacherStudentCallback(), checkpoint],
+        # Multi-crop ViTs resize positional embeddings with bicubic interpolation.
+        # Its CUDA backward lacks a deterministic implementation: warn rather
+        # than abort while still preferring deterministic kernels where possible.
+        deterministic="warn", logger=loggers,
+        callbacks=callbacks,
         log_every_n_steps=1 if args.smoke_test else 10,
         enable_model_summary=False,
     )

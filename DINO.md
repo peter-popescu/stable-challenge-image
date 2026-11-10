@@ -1,8 +1,16 @@
 # DINO experiment
 
 This experiment uses stable-pretraining 0.1.8's DINO method, loss, EMA teacher
-callback, and training loop. The encoder is a randomly initialized ViT with
-192-dimensional features, 3 attention heads, 10 blocks, and 8×8 patches.
+callback, and training loop. New runs default to a randomly initialized compact
+ResNet-18 (`--backbone resnet18_small`). It uses two residual blocks per stage,
+32/64/128/256 channels, a 3×3 stride-1 stem without max pooling, and global
+average pooling for 256-dimensional features. Half-width stages keep the
+FP32 encoder below the challenge's 20 MiB limit; this is not standard-width
+ResNet-18. BatchNorm floating statistics follow the EMA teacher update, while
+integer batch counters are copied from the student.
+
+The previous ViT remains available with `--backbone vit_tiny`: 192-dimensional
+features, 3 attention heads, 10 blocks, and 8×8 patches.
 It is a starting baseline, not a tuned model or a pretrained DINOv2 model.
 External pretrained weights remain an unresolved course-rule question.
 
@@ -17,7 +25,8 @@ prototypes, smaller crops/head, epoch-based EMA scheduling, and constant weight
 decay differ from the original ImageNet recipe.
 
 When resuming an older checkpoint, its original head and freeze settings are
-preserved. Start a fresh run in a new output directory to use the revised head.
+preserved, including the ViT architecture for checkpoints predating backbone
+selection. Backbone changes require a fresh run in a new output directory.
 
 The random seed is fixed (default 42). The trainer uses `deterministic="warn"`
 to prefer deterministic operations where available without aborting on the
@@ -45,13 +54,16 @@ for checking the pipeline; they are not a meaningful trained submission.
 Start training (the default data path is `data/train.parquet`):
 
 ```bash
-uv run main.py --epochs 100 --batch-size 64 --output runs/dino
+uv run main.py --backbone resnet18_small --epochs 300 --batch-size 64 \
+  --lr 0.0005 --seed 42 --local-crops 2 --output runs/dino-resnet
 ```
 
 Use `--accelerator gpu --precision 16-mixed --workers 4` on a CUDA machine.
 The default uses one available device with full precision. Lower the batch size
 if memory is limited. The initial learning rate is 0.0005; tune it alongside
-batch size. Use a new output directory for each independent experiment.
+batch size. Use a new output directory for each independent experiment. Both
+encoders initially use the same AdamW recipe for comparison; the ResNet recipe
+has not been tuned.
 
 ## Oscar batch jobs
 
@@ -73,18 +85,29 @@ additional Slurm tasks. This is a CPU budget, not per-worker core pinning.
 Training uses GPU acceleration and mixed precision.
 
 Follow progress with `tail -f dino-JOB_ID.out` and check the queue with
-`squeue -u "$USER"`. Outputs go to `runs/dino-JOB_ID/`.
+`squeue -u "$USER"`. Outputs go to `runs/dino-resnet-JOB_ID/`.
 To change the epoch count or use offline W&B logging, append training options:
 
 ```bash
 sbatch dino.sbatch --epochs 10 --wandb-mode offline
 ```
 
-The default time limit is 12 hours for the 100-epoch training run, including
+The batch script selects ResNet, 300 epochs, learning rate 0.0005, seed 42, and
+two local crops. The default time limit is 12 hours, including
 periodic accuracy probes. This is a conservative initial allocation, not a
 measured runtime estimate; adjust after observing completed epoch times on your
 assigned GPU. An epoch-end checkpoint is saved throughout training. To request
 a different limit, for example, use `sbatch --time=06:00:00 dino.sbatch`.
+
+For an Oscar L40S, use `sbatch --constraint=l40s dino.sbatch`. For Hydra's
+L40S node, override the partition and node:
+
+```bash
+sbatch --partition=gpus --gres=gpu:1 --nodelist=gpu2501 dino.sbatch
+```
+
+Append `--epochs 1` for a one-epoch check, or `--backbone vit_tiny` to select
+the previous encoder. Overrides follow the script filename.
 
 ### CUDA driver compatibility
 
@@ -116,7 +139,7 @@ Authenticate once, then enable W&B logging:
 
 ```bash
 uv run wandb login
-uv run main.py --wandb --wandb-project dino-experiment --wandb-name vit-tiny8-run1
+uv run main.py --wandb --wandb-project dino-experiment --wandb-name resnet18-small-run1
 ```
 
 Use `--wandb-entity YOUR_TEAM` to choose a team or account. W&B receives the
@@ -176,7 +199,7 @@ uv run main.py --export-checkpoint runs/dino/checkpoints/last.ckpt --output runs
 
 Checkpoints include teacher, student, optimizer, scheduler, and loss-center
 state. The exported `model.onnx` contains only the EMA teacher encoder, with
-192 features zero-padded to 1024. Export verifies agreement with PyTorch and
+256 ResNet features (or 192 ViT features) zero-padded to 1024. Export verifies agreement with PyTorch and
 checks the 20 MiB limit. Run the challenge validator before any upload:
 
 ```bash

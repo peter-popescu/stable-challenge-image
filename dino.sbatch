@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dino
+#SBATCH --job-name=dino-resnet
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
@@ -31,14 +31,18 @@ fi
 
 echo "DINO: accelerator=gpu tasks=1 cores=$SLURM_CPUS_PER_TASK workers=$workers training_threads=$OMP_NUM_THREADS"
 srun .venv/bin/python main.py \
+    --backbone resnet18_small \
     --accelerator gpu \
     --precision 16-mixed \
-    --epochs 100 \
+    --epochs 300 \
     --batch-size 64 \
+    --lr 0.0005 \
+    --seed 42 \
+    --local-crops 2 \
     --workers "$workers" \
     --probe-every 5 \
     --wandb \
     --wandb-project dino-experiment \
-    --wandb-name "oscar-${SLURM_JOB_ID}" \
-    --output "runs/dino-${SLURM_JOB_ID}" \
+    --wandb-name "resnet18-small-${SLURM_JOB_ID}" \
+    --output "runs/dino-resnet-${SLURM_JOB_ID}" \
     "$@"

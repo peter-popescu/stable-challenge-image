@@ -10,13 +10,13 @@ from main import ChallengeDINO, NormalizedPrototypes
 from submission import export_teacher
 
 
-@pytest.fixture
-def model():
+@pytest.fixture(params=["vit_tiny", "resnet18_small"])
+def model(request):
     previous = torch.get_num_threads()
     torch.set_num_threads(2)
     torch.manual_seed(17)
     model = ChallengeDINO(n_prototypes=16, normalize_prototypes=True,
-                          freeze_last_layer_epochs=1)
+                          freeze_last_layer_epochs=1, backbone=request.param)
     yield model
     torch.set_num_threads(previous)
 
@@ -95,9 +95,12 @@ def test_head_and_center_checkpoint_roundtrip_including_legacy(model, tmp_path):
     legacy = dict(model.hparams)
     legacy.pop("normalize_prototypes")
     legacy.pop("freeze_last_layer_epochs")
+    if model.hparams.backbone == "vit_tiny":
+        legacy.pop("backbone")  # checkpoints predating encoder selection
     restored = save_and_load(legacy, "legacy.ckpt")
     assert type(restored.projector.student[-1]) is torch.nn.Linear
     assert restored.hparams.freeze_last_layer_epochs == 0
+    assert restored.hparams.backbone == model.hparams.backbone
     torch.testing.assert_close(restored.dino_loss.center, model.dino_loss.center)
 
 
@@ -113,6 +116,30 @@ def test_monitoring_export_does_not_change_training_rng_or_encoder(model, tmp_pa
     monkeypatch.setattr("submission.export_onnx", fake_export)
     export_teacher(model, tmp_path / "check.onnx")
     assert torch.equal(torch.get_rng_state(), rng)
-    assert model.backbone.teacher.dynamic_img_size
+    if model.hparams.backbone == "vit_tiny":
+        assert model.backbone.teacher.dynamic_img_size
     for name, value in model.backbone.teacher.state_dict().items():
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_resnet_batchnorm_modes_updates_and_feature_shapes(model):
+    if model.hparams.backbone != "resnet18_small":
+        return
+    student = model.backbone.student
+    teacher = model.backbone.teacher
+    norms = [layer for layer in student.modules() if isinstance(layer, torch.nn.BatchNorm2d)]
+    teacher_norms = [layer for layer in teacher.modules() if isinstance(layer, torch.nn.BatchNorm2d)]
+    assert all(layer.training for layer in norms + teacher_norms)
+    assert all(layer.num_batches_tracked == 0 for layer in norms + teacher_norms)
+    assert student(torch.randn(2, 3, 96, 96)).shape == (2, 256)
+    assert student(torch.randn(2, 3, 48, 48)).shape == (2, 256)
+    model.backbone.update_teacher()
+    assert all(layer.num_batches_tracked == 2 for layer in norms + teacher_norms)
+    assert all(torch.isfinite(layer.running_var).all() for layer in norms + teacher_norms)
+    assert any(not torch.equal(layer.running_var, torch.ones_like(layer.running_var)) for layer in norms)
+    teacher.eval()
+    with torch.no_grad():
+        features = teacher(torch.randn(1, 3, 96, 96))
+    assert features.shape == (1, 256)
+    assert torch.isfinite(features).all()
+    assert sum(p.numel() for p in teacher.parameters()) * 4 < 20 * 1024**2

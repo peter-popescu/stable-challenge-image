@@ -75,59 +75,30 @@ class NormalizedPrototypes(torch.nn.Linear):
         return torch.nn.functional.linear(x, torch.nn.functional.normalize(self.weight, dim=1))
 
 
-class CNNTeacherStudentWrapper(spt.TeacherStudentWrapper):
-    """Preserve integer BatchNorm counters across the library's EMA update."""
-
-    @torch.no_grad()
-    def update_teacher(self):
-        super().update_teacher()
-        if self.training and self.ema_coefficient.item() != 1:
-            for teacher_buffer, student_buffer in zip(self.teacher.buffers(), self.student.buffers()):
-                if not teacher_buffer.is_floating_point():
-                    teacher_buffer.copy_(student_buffer)
-
-
 class ChallengeDINO(DINO):
     """Adapt stable-pretraining's DINO method to its dictionary training loop."""
 
     def __init__(self, epochs=100, lr=5e-4, weight_decay=0.04, n_prototypes=4096,
-                 normalize_prototypes=False, freeze_last_layer_epochs=0,
-                 backbone="vit_tiny"):
-        if backbone == "vit_tiny":
-            encoder = "vit_tiny_patch16_224"
-            encoder_kwargs = {"img_size": 96, "patch_size": 8, "depth": 10,
-                              "dynamic_img_size": True}
-        elif backbone == "mobilenet_v3_large":
-            from torchvision.models import mobilenet_v3_large
-
-            encoder = mobilenet_v3_large(weights=None)
-            encoder.classifier = torch.nn.Identity()
-            # DINO infers the feature dimension with a dummy forward. Do not
-            # update BatchNorm statistics with that synthetic image.
-            encoder.eval()
-            encoder_kwargs = None
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone}")
+                 normalize_prototypes=False, freeze_last_layer_epochs=0):
         super().__init__(
-            encoder_name=encoder,
-            encoder_kwargs=encoder_kwargs,
+            encoder_name="vit_tiny_patch16_224",
+            encoder_kwargs={
+                "img_size": 96,
+                "patch_size": 8,
+                "depth": 10,
+                "dynamic_img_size": True,
+            },
             pretrained=False,
             projector_hidden_dim=1024,
             projector_bottleneck_dim=128,
             n_prototypes=n_prototypes,
             warmup_epochs_temperature_teacher=min(30, max(1, epochs // 3)),
         )
-        if backbone == "mobilenet_v3_large":
-            self.backbone = CNNTeacherStudentWrapper(self.backbone.student)
-            # Shape inference above temporarily used eval mode. Lightning may
-            # retain the existing child modes at fit start, so restore them now.
-            self.backbone.train(self.training)
         self.save_hyperparameters({
             "epochs": epochs, "lr": lr, "weight_decay": weight_decay,
             "n_prototypes": n_prototypes,
             "normalize_prototypes": normalize_prototypes,
             "freeze_last_layer_epochs": freeze_last_layer_epochs,
-            "backbone": backbone,
         })
         # Defaults retain older checkpoint semantics; new runs enable both below.
         if normalize_prototypes:
@@ -173,8 +144,6 @@ class ChallengeDINO(DINO):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path(DEFAULT_PATH))
-    parser.add_argument("--backbone", choices=["vit_tiny", "mobilenet_v3_large"],
-                        help="Encoder for a new run (default: vit_tiny); resume restores checkpoint architecture")
     parser.add_argument("--output", type=Path, default=Path("runs/dino"))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -224,12 +193,9 @@ def main():
                         num_workers=args.workers, persistent_workers=args.workers > 0)
     if args.resume:
         model = ChallengeDINO.load_from_checkpoint(str(args.resume), map_location="cpu")
-        if args.backbone is not None and args.backbone != model.hparams.backbone:
-            raise ValueError("--backbone must match the resumed checkpoint")
     else:
         model = ChallengeDINO(epochs=args.epochs, lr=args.lr,
-                              normalize_prototypes=True, freeze_last_layer_epochs=1,
-                              backbone=args.backbone or "vit_tiny")
+                              normalize_prototypes=True, freeze_last_layer_epochs=1)
     args.output.mkdir(parents=True, exist_ok=True)
     checkpoint = ModelCheckpoint(dirpath=args.output / "checkpoints", save_last=True,
                                  save_top_k=0)
@@ -246,9 +212,7 @@ def main():
             save_dir=str(args.output), mode=args.wandb_mode,
             log_model=False,
             config={
-                "encoder": model.hparams.backbone, "embedding_dim": model.embed_dim,
-                "patch_size": 8 if model.hparams.backbone == "vit_tiny" else None,
-                "pretrained": False,
+                "encoder": "vit_tiny_patch8_depth10", "pretrained": False,
                 "batch_size": args.batch_size, "local_crops": args.local_crops,
                 "global_crop_size": 96, "local_crop_size": 48,
                 "seed": args.seed, "precision": args.precision,

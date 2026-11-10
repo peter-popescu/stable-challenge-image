@@ -10,13 +10,12 @@ from export_onnx import export_onnx
 
 def export_teacher(model, path):
     encoder = copy.deepcopy(model.backbone.teacher).cpu().eval()
-    if hasattr(encoder, "patch_embed"):
-        encoder.dynamic_img_size = False
-        encoder.patch_embed.strict_img_size = True
-        encoder.patch_embed.output_fmt = "NCHW"
-        encoder.patch_embed.flatten = True
-        for block in encoder.blocks:
-            block.attn.fused_attn = False
+    encoder.dynamic_img_size = False
+    encoder.patch_embed.strict_img_size = True
+    encoder.patch_embed.output_fmt = "NCHW"
+    encoder.patch_embed.flatten = True
+    for block in encoder.blocks:
+        block.attn.fused_attn = False
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Tracing's random example input must not change the training RNG stream.

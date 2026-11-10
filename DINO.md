@@ -6,6 +6,57 @@ callback, and training loop. The encoder is a randomly initialized ViT with
 It is a starting baseline, not a tuned model or a pretrained DINOv2 model.
 External pretrained weights remain an unresolved course-rule question.
 
+## MobileNet backbone comparison
+
+Select `--backbone mobilenet_v3_large` to train a randomly initialized
+torchvision MobileNetV3-Large with its classifier removed. Global average
+pooling produces 960-dimensional features, zero-padded to 1024 in ONNX. The
+ViT remains the default (`--backbone vit_tiny`). Both encoders use the same
+stable-pretraining DINO objective, head, global/local crops, and CPU ONNX
+leave-one-out probe. MobileNet BatchNorm running statistics follow the library's
+EMA update; integer batch counters are copied from the student without averaging.
+
+For a full one-epoch GPU check on Oscar:
+
+```bash
+sbatch --constraint=l40s dino-mobilenet.sbatch --epochs 1
+```
+
+For the 300-epoch comparison, using batch size 64, learning rate 0.0005, seed 42,
+and four loader workers:
+
+```bash
+sbatch --constraint=l40s dino-mobilenet.sbatch
+```
+
+Omit `--constraint=l40s` to accept any GPU type. The script requests one GPU,
+one task, six CPU cores, 32 GB RAM, and 12 hours. Logs are written to
+`dino-mobilenet-JOB_ID.out` and outputs to `runs/dino-mobilenet-JOB_ID/`.
+Run `uv sync --locked --python 3.12` before submitting after pulling updates.
+To run directly inside an allocated GPU session:
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 \
+  .venv/bin/python main.py --backbone mobilenet_v3_large --epochs 1 \
+  --accelerator gpu --precision 16-mixed --batch-size 64 --workers 4 \
+  --wandb --wandb-mode offline --output runs/mobilenet-check
+```
+
+New checkpoints record the architecture and export it automatically. Resume
+restores that architecture; old checkpoints without a backbone field remain
+ViTs. Start a fresh run when switching architectures. This comparison is not
+a claim that the same optimization settings are ideal for both encoders.
+
+The local full-epoch check completed 117 batches, saved/restored a checkpoint,
+logged the CPU LOO probe offline, and exported an 11.33 MiB ONNX model. It was
+tested on the Mac GPU in full precision, not Oscar CUDA/mixed precision.
+The one-epoch model passed structural submission checks but triggered the
+validator's low-embedding-variation warning. BatchNorm counters/statistics were
+verified to update; the stock MobileNet BatchNorm momentum is 0.01, so early
+evaluation statistics adapt slowly. Warmup is a possible contributor, not a
+guarantee that the warning will resolve. Inspect accuracy and feature variation
+after several epochs before treating the CNN as a successful quality baseline.
+
 New runs use a normalized prototype layer (fixed unit weight norms), truncated
 normal initialization for the projection head, and freeze the prototype layer
 during the first epoch. Biases and normalization parameters are excluded from

@@ -10,13 +10,14 @@ from main import ChallengeDINO, NormalizedPrototypes
 from submission import export_teacher
 
 
-@pytest.fixture
-def model():
+@pytest.fixture(params=["vit_tiny", "mobilenet_v3_large"])
+def model(request):
     previous = torch.get_num_threads()
     torch.set_num_threads(2)
     torch.manual_seed(17)
     model = ChallengeDINO(n_prototypes=16, normalize_prototypes=True,
-                          freeze_last_layer_epochs=1)
+                          freeze_last_layer_epochs=1, backbone=request.param)
+    model.train()
     yield model
     torch.set_num_threads(previous)
 
@@ -113,6 +114,46 @@ def test_monitoring_export_does_not_change_training_rng_or_encoder(model, tmp_pa
     monkeypatch.setattr("submission.export_onnx", fake_export)
     export_teacher(model, tmp_path / "check.onnx")
     assert torch.equal(torch.get_rng_state(), rng)
-    assert model.backbone.teacher.dynamic_img_size
+    if model.hparams.backbone == "vit_tiny":
+        assert model.backbone.teacher.dynamic_img_size
     for name, value in model.backbone.teacher.state_dict().items():
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+def test_cnn_batchnorm_counters_and_eval_embeddings(model):
+    if model.hparams.backbone != "mobilenet_v3_large":
+        return
+    student = model.backbone.student
+    teacher = model.backbone.teacher
+    bn = next(layer for layer in student.modules() if isinstance(layer, torch.nn.BatchNorm2d))
+    teacher_bn = next(layer for layer in teacher.modules() if isinstance(layer, torch.nn.BatchNorm2d))
+    assert bn.num_batches_tracked == 0  # no contamination from dummy shape inference
+    student(torch.randn(4, 3, 96, 96))
+    student(torch.randn(4, 3, 48, 48))
+    model.backbone.update_teacher()
+    assert bn.num_batches_tracked == teacher_bn.num_batches_tracked == 2
+    assert torch.isfinite(teacher_bn.running_var).all()
+    teacher.eval()
+    with torch.no_grad():
+        z = teacher(torch.randn(1, 3, 96, 96))
+    assert z.shape == (1, 960)
+    assert torch.isfinite(z).all()
+    assert sum(p.numel() for p in teacher.parameters()) * 4 < 20 * 1024**2
+
+
+def test_cnn_constructor_restores_batchnorm_training_after_shape_inference():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
+    try:
+        model = ChallengeDINO(backbone="mobilenet_v3_large", n_prototypes=16)
+        assert model.training
+        for encoder in (model.backbone.student, model.backbone.teacher):
+            norms = [layer for layer in encoder.modules() if isinstance(layer, torch.nn.BatchNorm2d)]
+            assert norms and all(layer.training for layer in norms)
+            assert all(layer.num_batches_tracked == 0 for layer in norms)
+            encoder(torch.randn(2, 3, 96, 96))
+            assert all(layer.num_batches_tracked == 1 for layer in norms)
+            assert any(not torch.equal(layer.running_var, torch.ones_like(layer.running_var))
+                       for layer in norms)
+    finally:
+        torch.set_num_threads(previous)

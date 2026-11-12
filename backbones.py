@@ -5,18 +5,18 @@ from torchvision.models.resnet import BasicBlock
 
 
 class SmallResNet18(nn.Module):
-    """ResNet-18 block layout with half-width stages and a low-resolution stem."""
+    """ResNet-18 block layout with configurable stage width and a small-image stem."""
 
-    def __init__(self):
+    def __init__(self, width=32):
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(3, width, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
         )
         stages = []
-        in_channels = 32
-        for index, channels in enumerate((32, 64, 128, 256)):
+        in_channels = width
+        for index, channels in enumerate((width, width * 2, width * 4, width * 8)):
             stride = 1 if index == 0 else 2
             downsample = None
             if stride != 1 or channels != in_channels:

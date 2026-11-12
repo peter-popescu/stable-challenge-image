@@ -100,8 +100,9 @@ class ChallengeDINO(DINO):
             encoder = "vit_tiny_patch16_224"
             encoder_kwargs = {"img_size": 96, "patch_size": 8, "depth": 10,
                               "dynamic_img_size": True}
-        elif backbone == "resnet18_small":
-            encoder = SmallResNet18().eval()
+        elif backbone in ("resnet18_small", "resnet18_wide"):
+            width = 40 if backbone == "resnet18_wide" else 32
+            encoder = SmallResNet18(width=width).eval()
             encoder_kwargs = None
         else:
             raise ValueError(f"Unsupported backbone: {backbone}")
@@ -114,7 +115,7 @@ class ChallengeDINO(DINO):
             n_prototypes=n_prototypes,
             warmup_epochs_temperature_teacher=min(30, max(1, epochs // 3)),
         )
-        if backbone == "resnet18_small":
+        if backbone in ("resnet18_small", "resnet18_wide"):
             self.backbone = CNNTeacherStudentWrapper(self.backbone.student)
             # DINO's dummy shape inference must not update BatchNorm stats;
             # restore training mode afterwards, including all child modules.
@@ -170,7 +171,7 @@ class ChallengeDINO(DINO):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path(DEFAULT_PATH))
-    parser.add_argument("--backbone", choices=["resnet18_small", "vit_tiny"],
+    parser.add_argument("--backbone", choices=["resnet18_small", "resnet18_wide", "vit_tiny"],
                         help="New-run encoder (default: resnet18_small); resume restores saved architecture")
     parser.add_argument("--output", type=Path, default=Path("runs/dino"))
     parser.add_argument("--epochs", type=int, default=100)

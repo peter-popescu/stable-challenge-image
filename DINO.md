@@ -9,6 +9,23 @@ FP32 encoder below the challenge's 20 MiB limit; this is not standard-width
 ResNet-18. BatchNorm floating statistics follow the EMA teacher update, while
 integer batch counters are copied from the student.
 
+Use `--backbone resnet18_wide` for a wider ResNet-18 with stages
+40/80/160/320 and 320-dimensional features. Its verified FP32 ONNX export is
+16.66 MiB, below the 20 MiB limit. It keeps the same blocks, stem,
+pooling, and DINO training method. This is a fresh architecture experiment,
+so start from scratch rather than resuming a width-32 checkpoint. Checkpoints
+record the backbone selection for later resume or export. The smaller ResNet
+remains the default, including in `dino.sbatch`.
+
+For the wider experiment on Oscar's L40S GPUs:
+
+```bash
+sbatch --constraint=l40s dino.sbatch \
+  --backbone resnet18_wide --epochs 300 --batch-size 64 \
+  --lr 0.001 --weight-decay 0.01 --local-crops 2 --seed 42 \
+  --wandb-name resnet18-wide-lr0.001-wd0.01-crops2-seed42
+```
+
 The previous ViT remains available with `--backbone vit_tiny`: 192-dimensional
 features, 3 attention heads, 10 blocks, and 8×8 patches.
 It is a starting baseline, not a tuned model or a pretrained DINOv2 model.
@@ -203,7 +220,8 @@ uv run main.py --export-checkpoint runs/dino/checkpoints/last.ckpt --output runs
 
 Checkpoints include teacher, student, optimizer, scheduler, and loss-center
 state. The exported `model.onnx` contains only the EMA teacher encoder, with
-256 ResNet features (or 192 ViT features) zero-padded to 1024. Export verifies agreement with PyTorch and
+256 small-ResNet features, 320 wide-ResNet features, or 192 ViT features,
+zero-padded to 1024. Export verifies agreement with PyTorch and
 checks the 20 MiB limit. Run the challenge validator before any upload:
 
 ```bash

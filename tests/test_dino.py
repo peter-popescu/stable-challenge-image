@@ -10,7 +10,7 @@ from main import ChallengeDINO, NormalizedPrototypes
 from submission import export_teacher
 
 
-@pytest.fixture(params=["vit_tiny", "resnet18_small"])
+@pytest.fixture(params=["vit_tiny", "resnet18_small", "resnet18_wide"])
 def model(request):
     previous = torch.get_num_threads()
     torch.set_num_threads(2)
@@ -123,16 +123,18 @@ def test_monitoring_export_does_not_change_training_rng_or_encoder(model, tmp_pa
 
 
 def test_resnet_batchnorm_modes_updates_and_feature_shapes(model):
-    if model.hparams.backbone != "resnet18_small":
+    if model.hparams.backbone == "vit_tiny":
         return
+    dim = 320 if model.hparams.backbone == "resnet18_wide" else 256
     student = model.backbone.student
     teacher = model.backbone.teacher
     norms = [layer for layer in student.modules() if isinstance(layer, torch.nn.BatchNorm2d)]
     teacher_norms = [layer for layer in teacher.modules() if isinstance(layer, torch.nn.BatchNorm2d)]
     assert all(layer.training for layer in norms + teacher_norms)
     assert all(layer.num_batches_tracked == 0 for layer in norms + teacher_norms)
-    assert student(torch.randn(2, 3, 96, 96)).shape == (2, 256)
-    assert student(torch.randn(2, 3, 48, 48)).shape == (2, 256)
+    assert model.embed_dim == dim
+    assert student(torch.randn(2, 3, 96, 96)).shape == (2, dim)
+    assert student(torch.randn(2, 3, 48, 48)).shape == (2, dim)
     model.backbone.update_teacher()
     assert all(layer.num_batches_tracked == 2 for layer in norms + teacher_norms)
     assert all(torch.isfinite(layer.running_var).all() for layer in norms + teacher_norms)
@@ -140,6 +142,6 @@ def test_resnet_batchnorm_modes_updates_and_feature_shapes(model):
     teacher.eval()
     with torch.no_grad():
         features = teacher(torch.randn(1, 3, 96, 96))
-    assert features.shape == (1, 256)
+    assert features.shape == (1, dim)
     assert torch.isfinite(features).all()
     assert sum(p.numel() for p in teacher.parameters()) * 4 < 20 * 1024**2

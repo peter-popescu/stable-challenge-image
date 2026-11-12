@@ -178,6 +178,8 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--local-crops", type=int, default=6)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.04,
+                        help="AdamW weight decay for new runs (resume restores the saved value)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--probe-every", type=int, default=5,
                         help="Log challenge-protocol leave-one-out accuracy every N epochs; 0 disables")
@@ -197,6 +199,8 @@ def parse_args():
         parser.error("epochs, batch-size and lr must be positive; workers and local-crops nonnegative")
     if args.resume and args.export_checkpoint:
         parser.error("choose either --resume or --export-checkpoint")
+    if not 0 <= args.weight_decay < float("inf"):
+        parser.error("weight-decay must be finite and nonnegative")
     if args.probe_every < 0:
         parser.error("probe-every must be nonnegative")
     return args
@@ -224,7 +228,7 @@ def main():
         if args.backbone is not None and args.backbone != model.hparams.backbone:
             raise ValueError("--backbone must match the resumed checkpoint")
     else:
-        model = ChallengeDINO(epochs=args.epochs, lr=args.lr,
+        model = ChallengeDINO(epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                               normalize_prototypes=True, freeze_last_layer_epochs=1,
                               backbone=args.backbone or "resnet18_small")
     args.output.mkdir(parents=True, exist_ok=True)

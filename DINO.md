@@ -65,6 +65,10 @@ batch size. Use a new output directory for each independent experiment. Both
 encoders initially use the same AdamW recipe for comparison; the ResNet recipe
 has not been tuned.
 
+Use `--weight-decay VALUE` to tune AdamW regularization for a fresh run
+(default `0.04`; biases and normalization parameters remain excluded).
+Resuming a checkpoint restores its saved optimizer settings.
+
 ## Oscar batch jobs
 
 Copy `dino.sbatch` to the project directory on Oscar. Submit from that directory

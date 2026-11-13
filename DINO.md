@@ -26,6 +26,29 @@ sbatch --constraint=l40s dino.sbatch \
   --wandb-name resnet18-wide-lr0.001-wd0.01-crops2-seed42
 ```
 
+### Deeper compact ResNet experiment
+
+Use `--backbone resnet34_small` to test ResNet-34 depth: 3/4/6/3 residual
+blocks, stages 28/56/112/224, and 224-dimensional features. It retains the same
+small-image stem, global average pooling, DINO head, BatchNorm/EMA handling,
+and export pipeline. The verified FP32 ONNX export is 15.56 MiB, below 20 MiB.
+This compares deeper/narrower against ResNet-18-wide, rather than isolating
+depth at identical width. All encoders are randomly initialized.
+
+Keep training settings matched to the 500-epoch wide-ResNet baseline:
+
+```bash
+sbatch --partition=gpu --gres=gpu:1 --constraint=l40s dino.sbatch \
+  --backbone resnet34_small --epochs 500 --batch-size 64 \
+  --lr 0.001 --weight-decay 0.01 --local-crops 2 --seed 42 \
+  --wandb-name resnet34-small-500ep-lr0.001-wd0.01-crops2-seed42
+```
+
+Start a fresh run; ResNet-18 checkpoints cannot resume into ResNet-34.
+The existing ResNet-18 and ViT defaults/checkpoints remain supported. Append
+`--epochs 1` for an initial cluster check. Measure epoch time before assuming
+the batch script's 12-hour allocation covers 500 epochs of the deeper model.
+
 The previous ViT remains available with `--backbone vit_tiny`: 192-dimensional
 features, 3 attention heads, 10 blocks, and 8×8 patches.
 It is a starting baseline, not a tuned model or a pretrained DINOv2 model.
@@ -220,7 +243,8 @@ uv run main.py --export-checkpoint runs/dino/checkpoints/last.ckpt --output runs
 
 Checkpoints include teacher, student, optimizer, scheduler, and loss-center
 state. The exported `model.onnx` contains only the EMA teacher encoder, with
-256 small-ResNet features, 320 wide-ResNet features, or 192 ViT features,
+256 small-ResNet-18 features, 320 wide-ResNet-18 features,
+224 compact-ResNet-34 features, or 192 ViT features,
 zero-padded to 1024. Export verifies agreement with PyTorch and
 checks the 20 MiB limit. Run the challenge validator before any upload:
 

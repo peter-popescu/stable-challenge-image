@@ -10,7 +10,7 @@ from main import ChallengeDINO, NormalizedPrototypes
 from submission import export_teacher
 
 
-@pytest.fixture(params=["vit_tiny", "resnet18_small", "resnet18_wide"])
+@pytest.fixture(params=["vit_tiny", "resnet18_small", "resnet18_wide", "resnet34_small"])
 def model(request):
     previous = torch.get_num_threads()
     torch.set_num_threads(2)
@@ -125,9 +125,11 @@ def test_monitoring_export_does_not_change_training_rng_or_encoder(model, tmp_pa
 def test_resnet_batchnorm_modes_updates_and_feature_shapes(model):
     if model.hparams.backbone == "vit_tiny":
         return
-    dim = 320 if model.hparams.backbone == "resnet18_wide" else 256
+    dim = {"resnet18_small": 256, "resnet18_wide": 320, "resnet34_small": 224}[model.hparams.backbone]
     student = model.backbone.student
     teacher = model.backbone.teacher
+    expected_depths = [3, 4, 6, 3] if model.hparams.backbone == "resnet34_small" else [2, 2, 2, 2]
+    assert [len(stage) for stage in student.stages] == expected_depths
     norms = [layer for layer in student.modules() if isinstance(layer, torch.nn.BatchNorm2d)]
     teacher_norms = [layer for layer in teacher.modules() if isinstance(layer, torch.nn.BatchNorm2d)]
     assert all(layer.training for layer in norms + teacher_norms)

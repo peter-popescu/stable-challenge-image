@@ -17,3 +17,7 @@ data/*
 
 # OS
 .DS_Store
+
+# Training outputs
+runs/
+logs/

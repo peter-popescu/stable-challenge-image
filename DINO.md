@@ -47,12 +47,63 @@ sbatch --partition=gpu --gres=gpu:1 --constraint=l40s dino.sbatch \
 Start a fresh run; ResNet-18 checkpoints cannot resume into ResNet-34.
 The existing ResNet-18 and ViT defaults/checkpoints remain supported. Append
 `--epochs 1` for an initial cluster check. Measure epoch time before assuming
-the batch script's 12-hour allocation covers 500 epochs of the deeper model.
+the batch script's 3-hour allocation covers 500 epochs of the deeper model.
 
 The previous ViT remains available with `--backbone vit_tiny`: 192-dimensional
 features, 3 attention heads, 10 blocks, and 8×8 patches.
 It is a starting baseline, not a tuned model or a pretrained DINOv2 model.
 External pretrained weights remain an unresolved course-rule question.
+
+### Shorter run with the longer schedule
+
+`--epochs` controls when training stops. Optional `--schedule-epochs` sets the
+learning-rate warmup/cosine horizon and teacher EMA horizon independently. It
+also determines teacher-temperature warmup length (still capped at 30 epochs,
+so both 300 and 500 have the same 30-epoch temperature warmup). Without this
+option, existing runs retain their original schedule behavior.
+
+```bash
+sbatch --partition=gpu --gres=gpu:1 dino.sbatch \
+  --backbone resnet18_wide --epochs 300 --schedule-epochs 500 \
+  --batch-size 64 --local-crops 2 --lr 0.001 --weight-decay 0.01 --seed 42 \
+  --wandb-name wide-300ep-schedule500-crops2-seed42
+```
+
+With the same batches/settings, this uses the first 300 epochs of the 500-epoch
+LR and EMA schedules. It does not compress 500 epochs of learning into 300 or
+guarantee the same accuracy. GPU/kernel randomness can still affect results.
+The schedule horizon must be at least the training duration. It is recorded
+in checkpoints and W&B. Resume restores it; an explicit conflicting override
+is rejected. To resume this run to 500 epochs, keep `--schedule-epochs 500`
+and the same batch size/data.
+
+### Optional learning-rate and teacher-momentum search
+
+`--teacher-momentum` sets the initial EMA coefficient for both encoder and
+projection head; it follows the existing cosine schedule towards 1. Its
+default remains 0.996. Values must be strictly between 0 and 1, and checkpoints
+preserve the setting. Resume restores it rather than resetting the teacher.
+
+`submit_dino_grid.sh` queues nine independent 500-epoch ResNet-18-wide runs:
+LR `{0.0007, 0.001, 0.0015}` crossed with initial teacher EMA
+`{0.996, 0.999, 0.9995}`. All use WD 0.01, two local crops, batch 64, and seed
+42. It includes a repeat of the existing baseline. Larger EMA means a slower
+teacher update, not a guaranteed improvement. This explores the teacher
+dynamics rather than spending another full grid on crop count.
+
+```bash
+# Optional: submits nine jobs, three hours each, without restricting the GPU model.
+bash submit_dino_grid.sh
+# Or request specific hardware:
+bash submit_dino_grid.sh --constraint=l40s
+# Hydra partition override:
+bash submit_dino_grid.sh --partition=gpus --constraint=l40s
+```
+
+Run the 300/500 schedule comparison first if compute is limited. Search results
+at 300 epochs need not rank configurations the same as at 500; the helper uses
+500 to match the established accuracy baseline. Confirm any winner with seed
+123, compare final exported ONNX scores, and retain existing strong models.
 
 New runs use a normalized prototype layer (fixed unit weight norms), truncated
 normal initialization for the projection head, and freeze the prototype layer
@@ -137,7 +188,7 @@ sbatch dino.sbatch --epochs 10 --wandb-mode offline
 ```
 
 The batch script selects ResNet, 300 epochs, learning rate 0.0005, seed 42, and
-two local crops. The default time limit is 12 hours, including
+two local crops. The default time limit is 3 hours, including
 periodic accuracy probes. This is a conservative initial allocation, not a
 measured runtime estimate; adjust after observing completed epoch times on your
 assigned GPU. An epoch-end checkpoint is saved throughout training. To request

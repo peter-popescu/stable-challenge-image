@@ -1,6 +1,7 @@
 """Local DINO experiment using stable-pretraining; see DINO.md for commands."""
 
 import argparse
+import math
 from pathlib import Path
 
 import lightning as pl
@@ -61,12 +62,35 @@ class DINOCrops(Dataset):
 
 def dino_schedule(optimizer, module):
     total_steps = int(module.trainer.estimated_stepping_batches)
+    schedule_epochs = module.hparams.get("schedule_epochs")
+    if schedule_epochs is not None:
+        total_steps = math.ceil(total_steps * schedule_epochs / module.trainer.max_epochs)
     if total_steps < 2:
         return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=1)
     return LinearWarmupCosineAnnealing(
         optimizer, total_steps=total_steps,
         peak_step=max(1, int(0.1 * total_steps)),
     )
+
+
+class ScheduledTeacherStudentCallback(TeacherStudentCallback):
+    """Use the saved schedule horizon even when training stops earlier."""
+
+    def _update_all_wrappers(self, trainer, pl_module):
+        horizon = pl_module.hparams.get("schedule_epochs")
+        if horizon is None or horizon == trainer.max_epochs:
+            return super()._update_all_wrappers(trainer, pl_module)
+        if not self._wrapper_found:
+            return
+        for module in pl_module.modules():
+            if isinstance(module, spt.TeacherStudentWrapper):
+                module.update_ema_coefficient(trainer.current_epoch, horizon)
+                module.update_teacher()
+                if self.verbose:
+                    pl_module.log("teacher_student/ema_coefficient", float(module.ema_coefficient),
+                                  on_step=True, on_epoch=False)
+                if hasattr(module, "_mark_updated"):
+                    module._mark_updated()
 
 
 class NormalizedPrototypes(torch.nn.Linear):
@@ -93,7 +117,11 @@ class ChallengeDINO(DINO):
 
     def __init__(self, epochs=100, lr=5e-4, weight_decay=0.04, n_prototypes=4096,
                  normalize_prototypes=False, freeze_last_layer_epochs=0,
-                 backbone="vit_tiny"):
+                 backbone="vit_tiny", schedule_epochs=None, teacher_momentum=0.996):
+        if schedule_epochs is not None and schedule_epochs < epochs:
+            raise ValueError("schedule_epochs must be at least epochs")
+        if not 0 < teacher_momentum < 1:
+            raise ValueError("teacher_momentum must be between 0 and 1")
         # The constructor default keeps checkpoints without a backbone field
         # compatible. New CLI runs select ResNet below.
         if backbone == "vit_tiny":
@@ -116,7 +144,7 @@ class ChallengeDINO(DINO):
             projector_hidden_dim=1024,
             projector_bottleneck_dim=128,
             n_prototypes=n_prototypes,
-            warmup_epochs_temperature_teacher=min(30, max(1, epochs // 3)),
+            warmup_epochs_temperature_teacher=min(30, max(1, (schedule_epochs or epochs) // 3)),
         )
         if backbone in ("resnet18_small", "resnet18_wide", "resnet34_small"):
             self.backbone = CNNTeacherStudentWrapper(self.backbone.student)
@@ -129,6 +157,7 @@ class ChallengeDINO(DINO):
             "normalize_prototypes": normalize_prototypes,
             "freeze_last_layer_epochs": freeze_last_layer_epochs,
             "backbone": backbone,
+            "schedule_epochs": schedule_epochs, "teacher_momentum": teacher_momentum,
         })
         # Defaults retain older checkpoint semantics; new runs enable both below.
         if normalize_prototypes:
@@ -140,6 +169,10 @@ class ChallengeDINO(DINO):
                     if layer.bias is not None:
                         torch.nn.init.zeros_(layer.bias)
             self.projector = spt.TeacherStudentWrapper(projector)
+        # Both the encoder and projection head use the same initial teacher EMA.
+        for wrapper in (self.backbone, self.projector):
+            wrapper.base_ema_coefficient.fill_(teacher_momentum)
+            wrapper.ema_coefficient.fill_(teacher_momentum)
         # In 0.1.8 the loss center is a plain attribute. Register it so device
         # transfers and checkpoints preserve this essential part of DINO state.
         del self.dino_loss.center
@@ -178,6 +211,10 @@ def parse_args():
                         help="New-run encoder (default: resnet18_small); resume restores saved architecture")
     parser.add_argument("--output", type=Path, default=Path("runs/dino"))
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--schedule-epochs", type=int,
+                        help="Warmup/LR/teacher schedule horizon; defaults to the training duration")
+    parser.add_argument("--teacher-momentum", type=float,
+                        help="Initial encoder and head EMA momentum for new runs (default: 0.996)")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--local-crops", type=int, default=6)
@@ -207,6 +244,10 @@ def parse_args():
         parser.error("weight-decay must be finite and nonnegative")
     if args.probe_every < 0:
         parser.error("probe-every must be nonnegative")
+    if args.schedule_epochs is not None and args.schedule_epochs < args.epochs:
+        parser.error("schedule-epochs must be at least epochs")
+    if args.teacher_momentum is not None and not 0 < args.teacher_momentum < 1:
+        parser.error("teacher-momentum must be between 0 and 1")
     return args
 
 
@@ -231,14 +272,22 @@ def main():
         model = ChallengeDINO.load_from_checkpoint(str(args.resume), map_location="cpu")
         if args.backbone is not None and args.backbone != model.hparams.backbone:
             raise ValueError("--backbone must match the resumed checkpoint")
+        if args.schedule_epochs is not None and args.schedule_epochs != model.hparams.schedule_epochs:
+            raise ValueError("--schedule-epochs must match the resumed checkpoint")
+        if args.teacher_momentum is not None and args.teacher_momentum != model.hparams.teacher_momentum:
+            raise ValueError("--teacher-momentum must match the resumed checkpoint")
+        if model.hparams.schedule_epochs is not None and args.epochs > model.hparams.schedule_epochs:
+            raise ValueError("Training duration cannot exceed the saved schedule horizon")
     else:
         model = ChallengeDINO(epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                               normalize_prototypes=True, freeze_last_layer_epochs=1,
+                              schedule_epochs=args.schedule_epochs,
+                              teacher_momentum=args.teacher_momentum if args.teacher_momentum is not None else 0.996,
                               backbone=args.backbone or "resnet18_small")
     args.output.mkdir(parents=True, exist_ok=True)
     checkpoint = ModelCheckpoint(dirpath=args.output / "checkpoints", save_last=True,
                                  save_top_k=0)
-    callbacks = [TeacherStudentCallback()]
+    callbacks = [ScheduledTeacherStudentCallback()]
     if args.probe_every:
         callbacks.append(ChallengeProbe(args.data, every_n_epochs=args.probe_every))
     callbacks.append(checkpoint)
@@ -253,6 +302,9 @@ def main():
             config={
                 "encoder": model.hparams.backbone, "embedding_dim": model.embed_dim,
                 "pretrained": False,
+                "training_epochs": args.epochs,
+                "schedule_epochs": model.hparams.schedule_epochs or args.epochs,
+                "teacher_momentum": model.hparams.teacher_momentum,
                 "batch_size": args.batch_size, "local_crops": args.local_crops,
                 "global_crop_size": 96, "local_crop_size": 48,
                 "seed": args.seed, "precision": args.precision,

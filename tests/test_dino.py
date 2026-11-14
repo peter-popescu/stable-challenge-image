@@ -95,6 +95,8 @@ def test_head_and_center_checkpoint_roundtrip_including_legacy(model, tmp_path):
     legacy = dict(model.hparams)
     legacy.pop("normalize_prototypes")
     legacy.pop("freeze_last_layer_epochs")
+    legacy.pop("schedule_epochs")
+    legacy.pop("teacher_momentum")
     if model.hparams.backbone == "vit_tiny":
         legacy.pop("backbone")  # checkpoints predating encoder selection
     restored = save_and_load(legacy, "legacy.ckpt")

@@ -5,6 +5,8 @@ Submission contract:
     output "embedding": float32 [B, 1024]
 """
 
+import os
+
 import numpy as np
 import onnxruntime as ort
 import torch
@@ -38,7 +40,14 @@ def export_onnx(encoder, path, pad=True):
                       dynamic_axes={"image": {0: "batch"}, "embedding": {0: "batch"}}, opset_version=17, dynamo=False)
     with torch.no_grad():
         ref = model(x).numpy()
-    out = ort.InferenceSession(path, providers=["CPUExecutionProvider"]).run(None, {"image": x.numpy()})[0]
+    # Explicit threads avoid ORT's automatic affinity pinning outside Slurm's
+    # CPU set. The comparison CLI already sets PyTorch's requested thread count.
+    options = ort.SessionOptions()
+    allocation = int(os.environ.get("SLURM_CPUS_PER_TASK", "2"))
+    options.intra_op_num_threads = max(1, min(torch.get_num_threads(), allocation))
+    options.inter_op_num_threads = 1
+    out = ort.InferenceSession(path, sess_options=options,
+                               providers=["CPUExecutionProvider"]).run(None, {"image": x.numpy()})[0]
     assert out.shape == (2, DIM), f"embedding shape {out.shape}, expected (B, {DIM})"
     np.testing.assert_allclose(out, ref, rtol=1e-3, atol=1e-4)
     print(f"exported {path}: output {out.shape}, matches PyTorch")

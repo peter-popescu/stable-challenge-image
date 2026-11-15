@@ -14,6 +14,7 @@ from stable_pretraining.methods.dino import DINO
 from stable_pretraining.optim.lr_scheduler import LinearWarmupCosineAnnealing
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
+from PIL import Image
 
 from backbones import SmallResNet18, SmallResNet34
 from export_onnx import MEAN, STD
@@ -24,11 +25,28 @@ from training_data import DEFAULT_PATH, load_training_data
 DEFAULT_AUGMENTATION = {
     "local_crop_min": 0.05, "local_crop_max": 0.4,
     "color_jitter_strength": 1.0, "solarize_probability": 0.2,
+    "rotate90_probability": 0.0,
 }
 
 
+class RandomRightAngleRotation:
+    """Rotate a PIL crop by 90, 180, or 270 degrees without interpolation."""
+
+    def __init__(self, probability):
+        if not 0 <= probability <= 1:
+            raise ValueError("Rotation probability must be between 0 and 1")
+        self.probability = probability
+
+    def __call__(self, image):
+        if torch.rand(()).item() >= self.probability:
+            return image
+        rotations = (Image.Transpose.ROTATE_90, Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_270)
+        return image.transpose(rotations[torch.randint(3, ()).item()])
+
+
 def crop_transform(size, scale, blur_probability, solarize=False,
-                   color_jitter_strength=1.0, solarize_probability=0.2):
+                   color_jitter_strength=1.0, solarize_probability=0.2,
+                   rotate90_probability=0.0):
     operations = [
         T.RandomResizedCrop(size, scale=scale, interpolation=T.InterpolationMode.BICUBIC),
         T.RandomHorizontalFlip(),
@@ -37,6 +55,10 @@ def crop_transform(size, scale, blur_probability, solarize=False,
         T.RandomGrayscale(p=0.2),
         T.RandomApply([T.GaussianBlur(9, sigma=(0.1, 2.0))], p=blur_probability),
     ]
+    # Omit the transform entirely when disabled: preserve the original RNG
+    # sequence as well as the images for all pre-existing experiments.
+    if rotate90_probability > 0:
+        operations.insert(2, RandomRightAngleRotation(rotate90_probability))
     if solarize:
         operations.append(T.RandomSolarize(128, p=solarize_probability))
     return T.Compose([*operations, T.ToTensor(), T.Normalize(MEAN, STD)])
@@ -52,14 +74,17 @@ class DINOCrops(Dataset):
             self.images = self.images.select(range(min(limit, len(self.images))))
         self.global_transforms = [
             crop_transform(96, (0.4, 1.0), 1.0,
-                           color_jitter_strength=augmentation["color_jitter_strength"]),
+                           color_jitter_strength=augmentation["color_jitter_strength"],
+                           rotate90_probability=augmentation["rotate90_probability"]),
             crop_transform(96, (0.4, 1.0), 0.1, solarize=True,
                            color_jitter_strength=augmentation["color_jitter_strength"],
-                           solarize_probability=augmentation["solarize_probability"]),
+                           solarize_probability=augmentation["solarize_probability"],
+                           rotate90_probability=augmentation["rotate90_probability"]),
         ]
         self.local_transform = crop_transform(
             48, (augmentation["local_crop_min"], augmentation["local_crop_max"]), 0.5,
-            color_jitter_strength=augmentation["color_jitter_strength"])
+            color_jitter_strength=augmentation["color_jitter_strength"],
+            rotate90_probability=augmentation["rotate90_probability"])
         self.local_crops = local_crops
 
     def __len__(self):
@@ -241,6 +266,8 @@ def parse_args():
                         help="Multiplier for all color-jitter strengths (default: 1; try 0.5)")
     parser.add_argument("--solarize-probability", type=float,
                         help="Solarization probability on the second global view (default: 0.2)")
+    parser.add_argument("--rotate90-probability", type=float,
+                        help="Per-view probability of a random 90/180/270-degree rotation (default: 0)")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.04,
                         help="AdamW weight decay for new runs (resume restores the saved value)")
@@ -291,6 +318,8 @@ def parse_args():
         parser.error("color-jitter-strength must be between 0 and 5")
     if not 0 <= augmentation["solarize_probability"] <= 1:
         parser.error("solarize-probability must be between 0 and 1")
+    if not 0 <= augmentation["rotate90_probability"] <= 1:
+        parser.error("rotate90-probability must be between 0 and 1")
     if args.probe_support_data and not args.probe_data:
         parser.error("probe-support-data requires probe-data")
     return args

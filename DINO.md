@@ -459,3 +459,29 @@ This submits two new 500-epoch jobs, three hours each, differing only in color
 jitter strength (1.0 vs 0.5). The training seed changes to 123, but the data split
 stays `data/holdout-v1`; do not make a new partition for the new seed. Compare
 both at completed epochs 370 and 500 as well as their separately recorded peaks.
+
+## Optional right-angle rotation ablation
+
+`--rotate90-probability` defaults to 0. When disabled, no rotation transform is
+inserted and no extra random numbers are consumed, preserving the earlier
+augmentation pipeline. Older checkpoints without the field restore probability
+0. Resume restores the saved probability and rejects explicit conflicting values.
+Existing submission helpers continue to use rotation disabled.
+
+```bash
+# Oscar: one additional job; original colors/crops with rotation enabled.
+bash submit_rotation.sh --constraint=l40s
+# Hydra alternative:
+bash submit_rotation.sh --partition=gpus --constraint="l40s|l40|rtx_a6000"
+```
+
+This creates a fresh seed-42, 500-epoch holdout experiment matched to the existing
+seed-42 baseline. Each global and local crop independently has a 50% chance of
+being rotated; a selected crop gets 90, 180, or 270 degrees with equal probability.
+PIL transpose performs exact right-angle rotations without interpolation or
+filled corners. The change applies to training images only; evaluator inputs
+and submission preprocessing are unchanged. The value is logged to W&B and saved
+in checkpoint augmentation settings. The helper requests one GPU for three hours,
+uses the existing data/holdout-v1 partition, and retains original color strength
+and solarization. Compare its holdout and macro accuracy with the baseline before
+combining rotation with another augmentation or retraining on the full dataset.

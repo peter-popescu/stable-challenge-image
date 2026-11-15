@@ -130,3 +130,26 @@ def test_export_onnx_pads_small_encoder(tmp_path):
 def test_export_onnx_rejects_too_many_features(tmp_path):
     with pytest.raises(ValueError, match="more than the 1024 allowed"):
         export_onnx(Flat(dim=2048), str(tmp_path / "model.onnx"))
+
+
+@pytest.mark.parametrize("allocation,expected", [(None, 2), ("1", 1), ("8", 4)])
+def test_export_validation_bounds_threads_to_allocation(tmp_path, monkeypatch, allocation, expected):
+    import export_onnx as exporter
+    if allocation is None:
+        monkeypatch.delenv("SLURM_CPUS_PER_TASK", raising=False)
+    else:
+        monkeypatch.setenv("SLURM_CPUS_PER_TASK", allocation)
+    original = ort.InferenceSession
+    captured = []
+    def session(*args, **kwargs):
+        captured.append(kwargs["sess_options"])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(exporter.ort, "InferenceSession", session)
+    previous = torch.get_num_threads()
+    torch.set_num_threads(4)
+    try:
+        export_onnx(Flat(dim=256), str(tmp_path / "threads.onnx"))
+        assert captured[0].intra_op_num_threads == expected
+        assert captured[0].inter_op_num_threads == 1
+    finally:
+        torch.set_num_threads(previous)

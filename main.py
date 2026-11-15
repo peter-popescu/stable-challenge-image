@@ -156,7 +156,11 @@ class ChallengeDINO(DINO):
     def __init__(self, epochs=100, lr=5e-4, weight_decay=0.04, n_prototypes=4096,
                  normalize_prototypes=False, freeze_last_layer_epochs=0,
                  backbone="vit_tiny", schedule_epochs=None, teacher_momentum=0.996,
-                 augmentation=None):
+                 augmentation=None, optimizer="adamw", sgd_momentum=0.9):
+        if optimizer not in ("adamw", "sgd"):
+            raise ValueError("optimizer must be adamw or sgd")
+        if not 0 <= sgd_momentum < 1:
+            raise ValueError("sgd_momentum must be between 0 (inclusive) and 1 (exclusive)")
         if schedule_epochs is not None and schedule_epochs < epochs:
             raise ValueError("schedule_epochs must be at least epochs")
         if not 0 < teacher_momentum < 1:
@@ -198,6 +202,7 @@ class ChallengeDINO(DINO):
             "backbone": backbone,
             "schedule_epochs": schedule_epochs, "teacher_momentum": teacher_momentum,
             "augmentation": {**DEFAULT_AUGMENTATION, **(augmentation or {})},
+            "optimizer": optimizer, "sgd_momentum": sgd_momentum,
         })
         # Defaults retain older checkpoint semantics; new runs enable both below.
         if normalize_prototypes:
@@ -217,9 +222,13 @@ class ChallengeDINO(DINO):
         # transfers and checkpoints preserve this essential part of DINO state.
         del self.dino_loss.center
         self.dino_loss.register_buffer("center", torch.zeros(1, n_prototypes))
+        optimizer_config = {"type": "SGD" if optimizer == "sgd" else "AdamW",
+                            "lr": lr, "weight_decay": weight_decay,
+                            "exclude_bias_norm": True}
+        if optimizer == "sgd":
+            optimizer_config["momentum"] = sgd_momentum
         self.optim = {
-            "optimizer": {"type": "AdamW", "lr": lr, "weight_decay": weight_decay,
-                          "exclude_bias_norm": True},
+            "optimizer": optimizer_config,
             "scheduler": dino_schedule,
             "interval": "step",
             "gradient_clip_val": 3.0,
@@ -269,8 +278,12 @@ def parse_args():
     parser.add_argument("--rotate90-probability", type=float,
                         help="Per-view probability of a random 90/180/270-degree rotation (default: 0)")
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--optimizer", choices=["adamw", "sgd"],
+                        help="New-run optimizer (default: adamw); resume restores the saved optimizer")
+    parser.add_argument("--sgd-momentum", type=float,
+                        help="SGD momentum for new SGD runs (default: 0.9)")
     parser.add_argument("--weight-decay", type=float, default=0.04,
-                        help="AdamW weight decay for new runs (resume restores the saved value)")
+                        help="Optimizer weight decay for new runs (default: 0.04; resume restores saved value)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--probe-every", type=int, default=5,
                         help="Log challenge-protocol leave-one-out accuracy every N epochs; 0 disables")
@@ -306,6 +319,11 @@ def parse_args():
         parser.error("schedule-epochs must be at least epochs")
     if args.teacher_momentum is not None and not 0 < args.teacher_momentum < 1:
         parser.error("teacher-momentum must be between 0 and 1")
+    if args.sgd_momentum is not None:
+        if not 0 <= args.sgd_momentum < 1:
+            parser.error("sgd-momentum must be between 0 (inclusive) and 1 (exclusive)")
+        if not args.resume and args.optimizer != "sgd":
+            parser.error("sgd-momentum requires optimizer sgd")
     augmentation = {key: getattr(args, key) if getattr(args, key) is not None else default
                     for key, default in DEFAULT_AUGMENTATION.items()}
     for key in ("local_crop_min", "local_crop_max"):
@@ -344,6 +362,11 @@ def main():
         model = ChallengeDINO.load_from_checkpoint(str(args.resume), map_location="cpu")
         if args.backbone is not None and args.backbone != model.hparams.backbone:
             raise ValueError("--backbone must match the resumed checkpoint")
+        if args.optimizer is not None and args.optimizer != model.hparams.optimizer:
+            raise ValueError("--optimizer must match the resumed checkpoint; optimizer changes require a fresh run")
+        if args.sgd_momentum is not None:
+            if model.hparams.optimizer != "sgd" or args.sgd_momentum != model.hparams.sgd_momentum:
+                raise ValueError("--sgd-momentum must match the resumed SGD checkpoint")
         if args.schedule_epochs is not None and args.schedule_epochs != model.hparams.schedule_epochs:
             raise ValueError("--schedule-epochs must match the resumed checkpoint")
         if args.teacher_momentum is not None and args.teacher_momentum != model.hparams.teacher_momentum:
@@ -365,6 +388,8 @@ def main():
                               normalize_prototypes=True, freeze_last_layer_epochs=1,
                               schedule_epochs=args.schedule_epochs,
                               augmentation=augmentation,
+                              optimizer=args.optimizer or "adamw",
+                              sgd_momentum=args.sgd_momentum if args.sgd_momentum is not None else 0.9,
                               teacher_momentum=args.teacher_momentum if args.teacher_momentum is not None else 0.996,
                               backbone=args.backbone or "resnet18_small")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -391,6 +416,8 @@ def main():
                 "training_epochs": args.epochs,
                 "schedule_epochs": model.hparams.schedule_epochs or args.epochs,
                 "teacher_momentum": model.hparams.teacher_momentum,
+                "optimizer": model.hparams.optimizer,
+                "sgd_momentum": model.hparams.sgd_momentum if model.hparams.optimizer == "sgd" else None,
                 **augmentation,
                 "batch_size": args.batch_size, "local_crops": args.local_crops,
                 "global_crop_size": 96, "local_crop_size": 48,

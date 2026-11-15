@@ -485,3 +485,51 @@ in checkpoint augmentation settings. The helper requests one GPU for three hours
 uses the existing data/holdout-v1 partition, and retains original color strength
 and solarization. Compare its holdout and macro accuracy with the baseline before
 combining rotation with another augmentation or retraining on the full dataset.
+
+## SGD optimization-recipe experiment
+
+`--optimizer sgd` opts into PyTorch SGD with momentum. `--sgd-momentum` defaults
+to 0.9 for SGD. Existing commands and checkpoints retain AdamW by default.
+Optimizer type and momentum are recorded in checkpoints and W&B. Resume restores
+the saved optimizer and rejects a conflicting optimizer or momentum request;
+changing optimizers requires a fresh run. Bias/norm parameters remain excluded
+from decay and frozen teacher parameters remain outside the optimizer.
+
+The search compares three actual peak learning rates: 0.005, 0.01, and 0.02,
+all with SGD momentum 0.9 and weight decay 0.0001. This project does not scale
+these LRs by batch size. They are an exploratory range around the original DINO
+CNN recipe's scale, not an exact reproduction of its ImageNet training. This
+is a recipe comparison (optimizer plus appropriate LR/decay), not an isolated
+optimizer-only ablation. The original recipe is documented at
+https://github.com/facebookresearch/dino#training.
+
+```bash
+# Oscar: three new jobs, one GPU and three hours each.
+bash submit_sgd_search.sh --constraint=l40s
+# Hydra alternative, using the same fixed split:
+bash submit_sgd_search.sh --partition=gpus --constraint="l40s|l40|rtx_a6000"
+```
+
+All use ResNet-18-wide, 500 training/schedule epochs, seed 42, batch 64, two
+local crops, teacher momentum 0.996, and original augmentations with rotation
+disabled. The training/probe files are the existing data/holdout-v1 partitions.
+No changes are made to existing batch scripts or earlier runs. Compare the
+500-epoch holdout and macro accuracies against the matched AdamW seed-42
+baseline (69.13% and 66.27%); keep peak comparisons separate. Repeat a promising
+SGD recipe with seed 123 and compare against that AdamW baseline (72.48% holdout,
+68.94% macro). The validated full-data 74.4% LOO has a different protocol and
+training-set size. Train on the full dataset only after choosing a supported
+recipe; keep the established AdamW submission candidate.
+
+For a one-epoch cluster check before queuing the full search:
+
+```bash
+sbatch --constraint=l40s --time=00:20:00 dino.sbatch \
+  --backbone resnet18_wide --optimizer sgd --sgd-momentum 0.9 \
+  --lr 0.01 --weight-decay 0.0001 --epochs 1 --schedule-epochs 500 \
+  --batch-size 64 --local-crops 2 --seed 42 \
+  --data data/holdout-v1/train.parquet \
+  --probe-data data/holdout-v1/holdout.parquet \
+  --probe-support-data data/holdout-v1/train.parquet \
+  --wandb-name sgd-holdout-one-epoch-check
+```

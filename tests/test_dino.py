@@ -10,13 +10,16 @@ from main import ChallengeDINO, NormalizedPrototypes
 from submission import MultiScaleResNet, export_teacher
 
 
-@pytest.fixture(params=["vit_tiny", "resnet18_small", "resnet18_wide", "resnet34_small"])
+@pytest.fixture(params=[("vit_tiny", "adamw"), ("resnet18_small", "adamw"),
+                        ("resnet18_wide", "adamw"), ("resnet34_small", "adamw"),
+                        ("resnet18_wide", "sgd")])
 def model(request):
     previous = torch.get_num_threads()
     torch.set_num_threads(2)
     torch.manual_seed(17)
     model = ChallengeDINO(n_prototypes=16, normalize_prototypes=True,
-                          freeze_last_layer_epochs=1, backbone=request.param)
+                          freeze_last_layer_epochs=1, backbone=request.param[0],
+                          optimizer=request.param[1])
     yield model
     torch.set_num_threads(previous)
 
@@ -28,7 +31,8 @@ def test_dino_student_updates_teacher_is_frozen_and_prototypes_unfreeze(model):
     teacher_before = next(model.backbone.teacher.parameters()).clone()
     student_before = next(model.backbone.student.parameters()).detach().clone()
     prototype_before = model.projector.student[-1].weight.detach().clone()
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+    optimizer = create_optimizer(list(model.parameters()), {**model.optim["optimizer"], "lr": 1e-3},
+                                 named_params=list(model.named_parameters()))
     output = DINO.forward(model, global_views=global_views, local_views=local_views)
     assert torch.isfinite(output.loss)
     assert output.student_logits.shape == (4, 2, 16)
@@ -92,18 +96,23 @@ def test_head_and_center_checkpoint_roundtrip_including_legacy(model, tmp_path):
     restored = save_and_load(dict(model.hparams), "new.ckpt")
     assert isinstance(restored.projector.student[-1], NormalizedPrototypes)
     assert restored.hparams.freeze_last_layer_epochs == 1
+    assert restored.hparams.optimizer == model.hparams.optimizer
     legacy = dict(model.hparams)
     legacy.pop("normalize_prototypes")
     legacy.pop("freeze_last_layer_epochs")
     legacy.pop("schedule_epochs")
     legacy.pop("teacher_momentum")
     legacy.pop("augmentation")
+    if model.hparams.optimizer == "adamw":
+        legacy.pop("optimizer")
+        legacy.pop("sgd_momentum")
     if model.hparams.backbone == "vit_tiny":
         legacy.pop("backbone")  # checkpoints predating encoder selection
     restored = save_and_load(legacy, "legacy.ckpt")
     assert type(restored.projector.student[-1]) is torch.nn.Linear
     assert restored.hparams.freeze_last_layer_epochs == 0
     assert restored.hparams.backbone == model.hparams.backbone
+    assert restored.hparams.optimizer == model.hparams.optimizer
     torch.testing.assert_close(restored.dino_loss.center, model.dino_loss.center)
 
 

@@ -17,3 +17,6 @@ data/*
 
 # OS
 .DS_Store
+
+# Local SSL artifacts
+experiment_outputs/

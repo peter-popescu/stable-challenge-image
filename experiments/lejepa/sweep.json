@@ -1,0 +1,6 @@
+{
+  "learning_rates": [0.0003, 0.001, 0.003],
+  "sigreg_weights": [0.005, 0.02, 0.08],
+  "screen_epochs": 100,
+  "retain_every": 50
+}

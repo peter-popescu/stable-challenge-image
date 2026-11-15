@@ -307,3 +307,93 @@ uv run evaluate.py runs/dino/model.onnx --data data/train.parquet
 The second command reports ridge-probe leave-one-out accuracy on the labelled
 training examples; it is a monitoring score, not the hidden evaluation score.
 No command here pushes code or uploads a submission.
+
+## Generalization and augmentation experiments
+
+The official `evaluate.py` remains unchanged. Local training-image LOO, a
+diagnostic image holdout, and the hidden challenge score answer different
+questions; none guarantees a particular value for the others.
+
+### Inspect an exported model
+
+Run this in a CPU allocation. It uses the official embedding normalization and
+ridge implementation, reporting identical overall LOO accuracy plus per-class
+accuracy, macro accuracy, a confusion matrix, and original row IDs of errors:
+
+```bash
+.venv/bin/python diagnose.py runs/dino-resnet-9061570/model.onnx \
+  --data data/train.parquet --out runs/diagnostics-9061570 --threads 4
+```
+
+`diagnostics.json` includes model/data SHA-256 hashes to identify exactly which
+artifact was evaluated. `mistakes.png` shows up to 24 mistakes with true and
+predicted class IDs. Macro accuracy weights classes equally; the official score
+continues to weight images equally. These labels are used only in diagnostics.
+
+### Prepare a fixed unseen-image diagnostic
+
+Create the split once and reuse it for every candidate:
+
+```bash
+.venv/bin/python prepare_holdout.py --out data/holdout-v1 --seed 2026 --fraction 0.2
+```
+
+This writes `train.parquet`, `holdout.parquet`, and `split.json`. The manifest
+contains original row indices and SHA-256 hashes. The two image partitions
+are disjoint. Labels stratify the diagnostic partition, not the DINO objective;
+training batches still contain only augmented images. Existing split directories
+are not overwritten. Copy the same files/manifest across clusters for comparisons.
+
+Fresh diagnostic encoders train on the approximately 80% training partition only.
+A separate CPU ridge probe fits labelled training-partition embeddings (including
+its usual LOO selection of lambda), and predicts the held-out labelled images.
+It never uses query labels to fit or choose lambda. The logs use
+`holdout/accuracy` and `holdout/macro_accuracy`, rather than `probe/loo_accuracy`.
+This tests unseen images from supported classes; it does not simulate unseen
+classes or domains in the private benchmark. Splitting data after an existing
+encoder saw every image does not make its score an unseen-image result.
+
+### Queue four controlled ablations
+
+```bash
+# Oscar: four new jobs, each requesting one GPU and three hours.
+bash submit_dino_augmentations.sh --holdout --constraint=l40s
+# Hydra alternative:
+bash submit_dino_augmentations.sh --holdout --partition=gpus \
+  --constraint="l40s|l40|rtx_a6000"
+```
+
+All four use wide ResNet-18, 500 epochs with a 500-epoch schedule, LR 0.0015,
+weight decay 0.01, teacher momentum 0.996, batch 64, two local crops, seed 42.
+The jobs are a matched baseline and one change each:
+
+| Run | Change |
+| --- | --- |
+| baseline | Original augmentations |
+| larger-local | Local crop area 0.15–0.4 instead of 0.05–0.4 |
+| gentler-color | Half the original color-jitter strength |
+| no-solarize | Solarization probability zero |
+
+Global crop scale stays 0.4–1.0; grayscale, blur, and flips stay unchanged.
+Individual CLI flags are `--local-crop-min`, `--local-crop-max`,
+`--color-jitter-strength`, and `--solarize-probability`. Defaults exactly retain
+the previous policy. Values are logged to W&B and stored in checkpoints. Resume
+restores them and rejects explicit conflicting augmentation overrides. Continue
+to supply the same training/probe files, crop count, and batch size when resuming.
+
+Compare the four `holdout/accuracy` curves against their new matched baseline,
+not against the full-data 74.4% LOO. Test a promising policy with seed 123.
+For a final submission candidate, train a fresh encoder on all `data/train.parquet`
+with the selected augmentation flags and the original monitoring protocol.
+Omitting `--holdout` from the helper instead queues all four on the full dataset.
+
+### Keep peak and final models
+
+When probes are enabled, new runs retain `best.onnx` and `best.json` as well as
+the final `model.onnx` and `checkpoints/last.ckpt`. Best refers to the configured
+local monitoring metric, not the hidden benchmark. `best.json` records the
+epoch, score, and protocol; the best ONNX is kept while the temporary probe
+export is available. Best exports are encoders, not resumable training checkpoints.
+A continuation in a new output directory tracks its own best in that segment;
+the original run's best stays in its original directory. Check both candidates
+with `test_submission.py` and `evaluate.py` before deciding what to submit.

@@ -21,32 +21,45 @@ from probe import ChallengeProbe
 from submission import export_teacher
 from training_data import DEFAULT_PATH, load_training_data
 
+DEFAULT_AUGMENTATION = {
+    "local_crop_min": 0.05, "local_crop_max": 0.4,
+    "color_jitter_strength": 1.0, "solarize_probability": 0.2,
+}
 
-def crop_transform(size, scale, blur_probability, solarize=False):
+
+def crop_transform(size, scale, blur_probability, solarize=False,
+                   color_jitter_strength=1.0, solarize_probability=0.2):
     operations = [
         T.RandomResizedCrop(size, scale=scale, interpolation=T.InterpolationMode.BICUBIC),
         T.RandomHorizontalFlip(),
-        T.RandomApply([T.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
+        T.RandomApply([T.ColorJitter(*(value * color_jitter_strength
+                                     for value in (0.4, 0.4, 0.2, 0.1)))], p=0.8),
         T.RandomGrayscale(p=0.2),
         T.RandomApply([T.GaussianBlur(9, sigma=(0.1, 2.0))], p=blur_probability),
     ]
     if solarize:
-        operations.append(T.RandomSolarize(128, p=0.2))
+        operations.append(T.RandomSolarize(128, p=solarize_probability))
     return T.Compose([*operations, T.ToTensor(), T.Normalize(MEAN, STD)])
 
 
 class DINOCrops(Dataset):
     """Read only images from local parquet; never pass labels to the model."""
 
-    def __init__(self, path, local_crops=6, limit=None):
+    def __init__(self, path, local_crops=6, limit=None, augmentation=None):
+        augmentation = {**DEFAULT_AUGMENTATION, **(augmentation or {})}
         self.images = load_training_data(str(path)).select_columns(["image"])
         if limit is not None:
             self.images = self.images.select(range(min(limit, len(self.images))))
         self.global_transforms = [
-            crop_transform(96, (0.4, 1.0), 1.0),
-            crop_transform(96, (0.4, 1.0), 0.1, solarize=True),
+            crop_transform(96, (0.4, 1.0), 1.0,
+                           color_jitter_strength=augmentation["color_jitter_strength"]),
+            crop_transform(96, (0.4, 1.0), 0.1, solarize=True,
+                           color_jitter_strength=augmentation["color_jitter_strength"],
+                           solarize_probability=augmentation["solarize_probability"]),
         ]
-        self.local_transform = crop_transform(48, (0.05, 0.4), 0.5)
+        self.local_transform = crop_transform(
+            48, (augmentation["local_crop_min"], augmentation["local_crop_max"]), 0.5,
+            color_jitter_strength=augmentation["color_jitter_strength"])
         self.local_crops = local_crops
 
     def __len__(self):
@@ -117,7 +130,8 @@ class ChallengeDINO(DINO):
 
     def __init__(self, epochs=100, lr=5e-4, weight_decay=0.04, n_prototypes=4096,
                  normalize_prototypes=False, freeze_last_layer_epochs=0,
-                 backbone="vit_tiny", schedule_epochs=None, teacher_momentum=0.996):
+                 backbone="vit_tiny", schedule_epochs=None, teacher_momentum=0.996,
+                 augmentation=None):
         if schedule_epochs is not None and schedule_epochs < epochs:
             raise ValueError("schedule_epochs must be at least epochs")
         if not 0 < teacher_momentum < 1:
@@ -158,6 +172,7 @@ class ChallengeDINO(DINO):
             "freeze_last_layer_epochs": freeze_last_layer_epochs,
             "backbone": backbone,
             "schedule_epochs": schedule_epochs, "teacher_momentum": teacher_momentum,
+            "augmentation": {**DEFAULT_AUGMENTATION, **(augmentation or {})},
         })
         # Defaults retain older checkpoint semantics; new runs enable both below.
         if normalize_prototypes:
@@ -218,12 +233,24 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--local-crops", type=int, default=6)
+    parser.add_argument("--local-crop-min", type=float,
+                        help="Minimum local-crop area fraction (default: 0.05)")
+    parser.add_argument("--local-crop-max", type=float,
+                        help="Maximum local-crop area fraction (default: 0.4)")
+    parser.add_argument("--color-jitter-strength", type=float,
+                        help="Multiplier for all color-jitter strengths (default: 1; try 0.5)")
+    parser.add_argument("--solarize-probability", type=float,
+                        help="Solarization probability on the second global view (default: 0.2)")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=0.04,
                         help="AdamW weight decay for new runs (resume restores the saved value)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--probe-every", type=int, default=5,
                         help="Log challenge-protocol leave-one-out accuracy every N epochs; 0 disables")
+    parser.add_argument("--probe-data", type=Path,
+                        help="Monitoring images/labels (default: training data)")
+    parser.add_argument("--probe-support-data", type=Path,
+                        help="Fit the diagnostic ridge probe on this separate file; log holdout metrics")
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu", "mps"], default="auto")
     parser.add_argument("--precision", default="32-true")
     parser.add_argument("--wandb", action="store_true", help="Log metrics and configuration to Weights & Biases")
@@ -248,6 +275,20 @@ def parse_args():
         parser.error("schedule-epochs must be at least epochs")
     if args.teacher_momentum is not None and not 0 < args.teacher_momentum < 1:
         parser.error("teacher-momentum must be between 0 and 1")
+    augmentation = {key: getattr(args, key) if getattr(args, key) is not None else default
+                    for key, default in DEFAULT_AUGMENTATION.items()}
+    for key in ("local_crop_min", "local_crop_max"):
+        if getattr(args, key) is not None and not 0 < getattr(args, key) <= 1:
+            parser.error("local-crop fractions must be between 0 and 1")
+    check_pair = not args.resume or (args.local_crop_min is not None and args.local_crop_max is not None)
+    if check_pair and not 0 < augmentation["local_crop_min"] <= augmentation["local_crop_max"] <= 1:
+        parser.error("local-crop fractions must satisfy 0 < min <= max <= 1")
+    if not 0 <= augmentation["color_jitter_strength"] <= 5:
+        parser.error("color-jitter-strength must be between 0 and 5")
+    if not 0 <= augmentation["solarize_probability"] <= 1:
+        parser.error("solarize-probability must be between 0 and 1")
+    if args.probe_support_data and not args.probe_data:
+        parser.error("probe-support-data requires probe-data")
     return args
 
 
@@ -263,11 +304,9 @@ def main():
         args.accelerator, args.precision = "cpu", "32-true"
         args.batch_size, args.workers, args.local_crops = 2, 0, 2
         torch.set_num_threads(2)
-    dataset = DINOCrops(args.data, args.local_crops, limit=4 if args.smoke_test else None)
-    if len(dataset) < args.batch_size:
-        raise ValueError("Dataset must contain at least one full batch; lower --batch-size")
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
-                        num_workers=args.workers, persistent_workers=args.workers > 0)
+    augmentation = {key: getattr(args, key) if getattr(args, key) is not None else default
+                    for key, default in DEFAULT_AUGMENTATION.items()}
+    model = None
     if args.resume:
         model = ChallengeDINO.load_from_checkpoint(str(args.resume), map_location="cpu")
         if args.backbone is not None and args.backbone != model.hparams.backbone:
@@ -278,10 +317,21 @@ def main():
             raise ValueError("--teacher-momentum must match the resumed checkpoint")
         if model.hparams.schedule_epochs is not None and args.epochs > model.hparams.schedule_epochs:
             raise ValueError("Training duration cannot exceed the saved schedule horizon")
-    else:
+        augmentation = dict(model.hparams.augmentation)
+        for key in DEFAULT_AUGMENTATION:
+            if getattr(args, key) is not None and getattr(args, key) != augmentation[key]:
+                raise ValueError(f"--{key.replace('_', '-')} must match the resumed checkpoint")
+    dataset = DINOCrops(args.data, args.local_crops, limit=4 if args.smoke_test else None,
+                        augmentation=augmentation)
+    if len(dataset) < args.batch_size:
+        raise ValueError("Dataset must contain at least one full batch; lower --batch-size")
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True,
+                        num_workers=args.workers, persistent_workers=args.workers > 0)
+    if model is None:
         model = ChallengeDINO(epochs=args.epochs, lr=args.lr, weight_decay=args.weight_decay,
                               normalize_prototypes=True, freeze_last_layer_epochs=1,
                               schedule_epochs=args.schedule_epochs,
+                              augmentation=augmentation,
                               teacher_momentum=args.teacher_momentum if args.teacher_momentum is not None else 0.996,
                               backbone=args.backbone or "resnet18_small")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -289,7 +339,10 @@ def main():
                                  save_top_k=0)
     callbacks = [ScheduledTeacherStudentCallback()]
     if args.probe_every:
-        callbacks.append(ChallengeProbe(args.data, every_n_epochs=args.probe_every))
+        callbacks.append(ChallengeProbe(args.probe_data or args.data,
+                                       every_n_epochs=args.probe_every,
+                                       support_data=args.probe_support_data,
+                                       output_dir=args.output))
     callbacks.append(checkpoint)
     loggers = [CSVLogger(str(args.output), name="logs")]
     wandb_logger = None
@@ -305,11 +358,16 @@ def main():
                 "training_epochs": args.epochs,
                 "schedule_epochs": model.hparams.schedule_epochs or args.epochs,
                 "teacher_momentum": model.hparams.teacher_momentum,
+                **augmentation,
                 "batch_size": args.batch_size, "local_crops": args.local_crops,
                 "global_crop_size": 96, "local_crop_size": 48,
                 "seed": args.seed, "precision": args.precision,
                 "smoke_test": args.smoke_test,
-                "probe_every": args.probe_every, "probe_protocol": "onnx_cpu_ridge_loo",
+                "probe_every": args.probe_every,
+                "probe_protocol": "support_query" if args.probe_support_data else "onnx_cpu_ridge_loo",
+                "training_data": str(args.data),
+                "probe_data": str(args.probe_data or args.data),
+                "probe_support_data": str(args.probe_support_data) if args.probe_support_data else None,
             },
         )
         loggers.append(wandb_logger)

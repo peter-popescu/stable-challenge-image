@@ -1,0 +1,27 @@
+{
+  "seed": 43,
+  "epochs": 400,
+  "batch_size": 128,
+  "workers": 0,
+  "lr": 0.003,
+  "weight_decay": 0.0001,
+  "warmup_epochs": 10,
+  "lamb": 0.005,
+  "n_slices": 1024,
+  "global_views": 2,
+  "local_views": 2,
+  "local_size": 48,
+  "global_scale": [
+    0.6,
+    1.0
+  ],
+  "local_scale": [
+    0.3,
+    0.6
+  ],
+  "jitter": 0.2,
+  "jitter_probability": 0.5,
+  "grayscale_probability": 0.05,
+  "horizontal_flip": 0.5,
+  "vertical_flip": 0.0
+}

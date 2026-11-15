@@ -397,3 +397,65 @@ export is available. Best exports are encoders, not resumable training checkpoin
 A continuation in a new output directory tracks its own best in that segment;
 the original run's best stays in its original directory. Check both candidates
 with `test_submission.py` and `evaluate.py` before deciding what to submit.
+
+## CPU-only intermediate-feature comparison
+
+`compare_feature_exports.py` loads one existing compact-ResNet checkpoint and
+exports both the usual final-stage embedding and a multiscale embedding from
+the exact same teacher weights. Multiscale concatenates global-average-pooled
+outputs of stages 2, 3, and 4. ResNet-18-wide produces 80 + 160 + 320 = 560
+features, zero-padded to 1024. It has no extra trained parameters and requires
+no retraining. Its value is an experimental hypothesis, not a promised gain.
+The default training/monitoring export remains the original final-stage version.
+
+Inside an Oscar CPU allocation:
+
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4
+
+# Compare the full-data model against its own ordinary export.
+.venv/bin/python compare_feature_exports.py \
+  runs/dino-resnet-9061570/checkpoints/last.ckpt \
+  --data data/train.parquet --out runs/features-9061570 --threads 4
+
+# Independently compare the matched holdout-baseline encoder.
+.venv/bin/python compare_feature_exports.py \
+  runs/dino-resnet-9113501/checkpoints/last.ckpt \
+  --data data/holdout-v1/holdout.parquet \
+  --support-data data/holdout-v1/train.parquet \
+  --out runs/features-9113501 --threads 4
+```
+
+Each comparison saves `final/model.onnx`, `multiscale/model.onnx`, per-class
+`diagnostics.json` reports, mistake sheets, and `comparison.json`. It prints
+changes in image-weighted and macro accuracy. The reports contain file hashes.
+Existing output directories are rejected to protect earlier artifacts. These
+comparisons use final training checkpoints, not the independently saved peak
+`best.onnx`, which is not a resumable PyTorch checkpoint.
+
+Look for gains on both protocols, including the previously weak galaxy classes,
+before selecting an export. Do not compare the holdout percentage directly with
+full-data LOO. Both final and multiscale ONNX files must still fit 20 MiB; export
+checks PyTorch/ONNX agreement and size. Run `test_submission.py` on any candidate
+before uploading it. The script neither logs a W&B run nor submits anything.
+
+For exporting a single view without evaluation:
+
+```bash
+.venv/bin/python main.py \
+  --export-checkpoint runs/dino-resnet-9061570/checkpoints/last.ckpt \
+  --export-features multiscale --output runs/multiscale-9061570
+```
+
+`--export-features multiscale` is export-only and rejects ViT checkpoints.
+
+For the matched seed-123 baseline vs gentler-color repeat on the existing split:
+
+```bash
+bash submit_color_repeat.sh --constraint=l40s
+```
+
+This submits two new 500-epoch jobs, three hours each, differing only in color
+jitter strength (1.0 vs 0.5). The training seed changes to 123, but the data split
+stays `data/holdout-v1`; do not make a new partition for the new seed. Compare
+both at completed epochs 370 and 500 as well as their separately recorded peaks.

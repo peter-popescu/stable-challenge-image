@@ -7,7 +7,7 @@ from stable_pretraining.methods.dino import DINO
 from stable_pretraining.optim.utils import create_optimizer, is_bias_or_norm_param
 
 from main import ChallengeDINO, NormalizedPrototypes
-from submission import export_teacher
+from submission import MultiScaleResNet, export_teacher
 
 
 @pytest.fixture(params=["vit_tiny", "resnet18_small", "resnet18_wide", "resnet34_small"])
@@ -150,3 +150,32 @@ def test_resnet_batchnorm_modes_updates_and_feature_shapes(model):
     assert features.shape == (1, dim)
     assert torch.isfinite(features).all()
     assert sum(p.numel() for p in teacher.parameters()) * 4 < 20 * 1024**2
+
+
+def test_multiscale_features_keep_final_features_and_original_encoder(model, tmp_path, monkeypatch):
+    if model.hparams.backbone == "vit_tiny":
+        with pytest.raises(ValueError, match="compact ResNet"):
+            export_teacher(model, tmp_path / "invalid.onnx", features="multiscale")
+        return
+    teacher = model.backbone.teacher.eval()
+    before = {key: value.clone() for key, value in teacher.state_dict().items()}
+    wrapper = MultiScaleResNet(teacher).eval()
+    assert {id(p) for p in wrapper.parameters()} == {id(p) for p in teacher.parameters()}
+    image = torch.randn(3, 3, 96, 96)
+    with torch.no_grad():
+        features = wrapper(image)
+        assert features.shape == (3, model.embed_dim * 7 // 4)
+        torch.testing.assert_close(features[:, -model.embed_dim:], teacher(image))
+    rng = torch.get_rng_state().clone()
+    def fake_export(encoder, path):
+        assert isinstance(encoder, MultiScaleResNet)
+        assert not encoder.training
+        assert not encoder.encoder.training
+        torch.randn(17)
+        with open(path, "wb") as stream:
+            stream.write(b"multiscale export")
+    monkeypatch.setattr("submission.export_onnx", fake_export)
+    export_teacher(model, tmp_path / "multi.onnx", features="multiscale")
+    assert torch.equal(rng, torch.get_rng_state())
+    for key, value in teacher.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)

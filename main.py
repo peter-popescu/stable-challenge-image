@@ -261,12 +261,16 @@ def parse_args():
     parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
     parser.add_argument("--resume", type=Path, help="Resume a trusted local training checkpoint")
     parser.add_argument("--export-checkpoint", type=Path, help="Export a trusted local checkpoint without training")
+    parser.add_argument("--export-features", choices=["final", "multiscale"], default="final",
+                        help="Export-only feature selection; multiscale concatenates compact ResNet stages 2–4")
     parser.add_argument("--smoke-test", action="store_true", help="Two small CPU training steps, checkpoint, and ONNX export")
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.workers < 0 or args.local_crops < 0 or args.lr <= 0:
         parser.error("epochs, batch-size and lr must be positive; workers and local-crops nonnegative")
     if args.resume and args.export_checkpoint:
         parser.error("choose either --resume or --export-checkpoint")
+    if args.export_features != "final" and not args.export_checkpoint:
+        parser.error("export-features multiscale requires export-checkpoint")
     if not 0 <= args.weight_decay < float("inf"):
         parser.error("weight-decay must be finite and nonnegative")
     if args.probe_every < 0:
@@ -298,7 +302,7 @@ def main():
     pl.seed_everything(args.seed, workers=True)
     if args.export_checkpoint:
         model = ChallengeDINO.load_from_checkpoint(str(args.export_checkpoint), map_location="cpu")
-        export_teacher(model, args.output / "model.onnx")
+        export_teacher(model, args.output / "model.onnx", features=args.export_features)
         return
     if args.smoke_test:
         args.accelerator, args.precision = "cpu", "32-true"

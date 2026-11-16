@@ -1,5 +1,67 @@
 # DINO experiment
 
+## Diagnose classifier limitations from cached embeddings
+
+`compare_probes.py` compares three diagnostic readouts without retraining the
+encoder: the unchanged official ridge implementation, nearest-class-centroid
+(Euclidean distances after support-only standardization), and class-balanced
+ridge (inverse-class-frequency weighted squared loss with an unpenalized
+intercept). Balanced ridge selects regularization using inner stratified CV
+on the support set, minimizing class-balanced prediction MSE. There is no
+supervised update to the encoder, and the exported model is not changed.
+
+For a training-image cache (`same_pool=True`), all three use the **same five
+outer folds**. Query images do not fit normalization, centroids, class weights,
+or hyperparameters. This is important: comparing an in-sample centroid score
+against ridge LOO would be misleading. The script also reports the original
+official LOO score separately as a reference; it uses more labelled support
+than the outer-fold diagnostics. Compare the three outer-fold scores with one
+another, rather than treating their difference from reference LOO as an effect
+of the classifier alone.
+
+For a genuine support/query cache the existing support/query separation is
+retained; only balanced-ridge hyperparameter selection uses inner support folds.
+Image row indices in different parquet files are file-local, not source-global.
+All outputs preserve model/data hashes. Alternative probes cannot replace the
+challenge's official score. Results on training-image caches do not measure
+generalization to images or classes absent from SSL pretraining.
+
+On Oscar, from the project directory:
+
+```bash
+sbatch compare_probes.sbatch
+```
+
+This requests **four CPU cores, 16 GiB RAM, and 20 minutes, with no GPU**. It
+compares jobs `9061570` (original baseline) and `9188109` (KoLeo). Existing
+`runs/diagnostics-JOBID/embeddings.npz` caches are reused after checking their
+model hashes; missing caches are generated using `diagnose.py --save-embeddings`.
+Optional positional job IDs override those two defaults.
+
+Progress and printed summaries appear in `probe-compare-SLURM_JOB_ID.out`.
+Reports go to `runs/probe-comparison-MODEL_JOB_ID-SLURM_JOB_ID/`:
+
+* `comparison.json`: overall/macro/domain/class accuracy, confusion matrices,
+  predicted-class frequencies, provenance and fold hyperparameters.
+* `predictions.csv`: row index, true class, outer fold, official reference
+  prediction and the three matched diagnostic predictions.
+
+The printed focus classes are 18, 19, 21, 25, 16 and 26. Class balancing or
+centroid recovery would suggest a readout/geometry limitation; failure across
+readouts strengthens (but does not prove) the case for representation/support
+limitations. These findings must be checked against the existing honest holdout
+experiments before promoting a training change.
+
+For a single existing cache, including the holdout caches saved at the end of
+the followup runs:
+
+```bash
+.venv/bin/python compare_probes.py runs/diagnostics-9188109/embeddings.npz \
+  --out runs/readout-comparison-9188109 --folds 5 --inner-folds 3 --seed 2026
+```
+
+The output directory must be new, so earlier reports are not overwritten.
+
 ## Detail preservation and feature-spreading comparisons
 
 `submit_dino_followups.sh` queues **five** fresh, one-setting comparisons with

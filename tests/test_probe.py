@@ -83,3 +83,38 @@ def test_support_query_metrics_are_separate_from_official_loo(monkeypatch, tmp_p
     assert records[0]["holdout/accuracy"] == 0.5
     assert records[0]["holdout/macro_accuracy"] == 0.4
     assert "probe/loo_accuracy" not in records[0]
+
+
+def test_final_diagnostics_log_separate_metrics_and_reuse_final_export(monkeypatch, tmp_path):
+    calls, records = [], []
+    def export(model, path):
+        path.write_bytes(b"encoder")
+        return path
+    def diagnostic(*args, **kwargs):
+        calls.append(kwargs)
+        result = {"score": 0.7, "macro_accuracy": 0.65, "images": 149,
+                  "classes": 29, "lambda": 1,
+                  "domains": {"galaxy": {"accuracy": 0.5}}}
+        if kwargs.get("low_shot"):
+            result["low_support"] = {"shots": 5, "accuracy_mean": 0.6,
+                                      "accuracy_std": 0.02, "macro_accuracy_mean": 0.55}
+        return result
+    monkeypatch.setattr("probe.export_teacher", export)
+    monkeypatch.setattr("probe.diagnose", diagnostic)
+    logger = SimpleNamespace(log_metrics=lambda metrics, step: records.append(metrics))
+    trainer = SimpleNamespace(current_epoch=0, max_epochs=2, global_step=2, loggers=[logger])
+    callback = ChallengeProbe("query", support_data="support", output_dir=tmp_path,
+                              low_shot=5, repeats=10, seed=2026)
+    callback.on_train_epoch_end(trainer, object())
+    trainer.current_epoch = 1
+    callback.on_train_epoch_end(trainer, object())
+    assert "low_shot" not in calls[0]
+    assert calls[1]["low_shot"] == 5
+    assert calls[1]["seed"] == 2026
+    assert "holdout/final_accuracy" not in records[0]
+    assert records[1]["holdout/final_accuracy"] == 0.7
+    assert records[1]["holdout/domain/galaxy_accuracy"] == 0.5
+    assert records[1]["holdout/low_shot_5/accuracy_mean"] == 0.6
+    report = json.loads((tmp_path / "probe-final.json").read_text())
+    assert report["epoch"] == 2
+    assert len((tmp_path / "probe-history.jsonl").read_text().splitlines()) == 2

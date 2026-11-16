@@ -1,5 +1,129 @@
 # DINO experiment
 
+## Detail preservation and feature-spreading comparisons
+
+`submit_dino_followups.sh` queues **five** fresh, one-setting comparisons with
+the existing wide-ResNet AdamW baseline. Each requests one GPU, six CPU cores,
+32 GiB RAM, and **three hours**. Nothing is submitted by installing this code.
+Defaults remain unchanged for earlier experiments and checkpoints.
+
+| Experiment name | Only training change from baseline |
+| --- | --- |
+| `global-crop` | Global minimum crop area 0.4 → 0.6 |
+| `no-local` | Local crops 2 → 0; both global crops retained |
+| `less-blur` | Maximum blur sigma 2.0 → 0.8 on every view; probabilities unchanged |
+| `koleo001` | Add encoder KoLeo regularization, weight 0.01 |
+| `koleo005` | Add encoder KoLeo regularization, weight 0.05 |
+
+All use `resnet18_wide`, AdamW, LR 0.0015, WD 0.01, EMA 0.996,
+batch 64, 500 training/schedule epochs, original color augmentation, and no
+rotation. KoLeo is applied to normalized **student encoder features before the
+projection head**, for the first global crop only. Neighbours are different
+images in the same batch. It reuses the original student forward pass, leaving
+BatchNorm updates unchanged. The loss calculation runs in float32 under mixed
+precision; `train/dino_loss` and unweighted `train/koleo_loss` are logged separately
+when enabled. `train/loss` includes the weighted regularizer. This is an opt-in
+DINO adaptation, not a complete DINOv2 implementation.
+
+Reuse `data/holdout-v1` exactly; do not regenerate the split when changing the
+training seed. On Oscar, from the project directory:
+
+```bash
+# Review the five commands without submitting.
+DRY_RUN=1 bash submit_dino_followups.sh --constraint=l40s
+# Submit five jobs, seed 42.
+bash submit_dino_followups.sh --constraint=l40s
+```
+
+For Hydra, use `--partition=gpus` and an available feature constraint:
+
+```bash
+bash submit_dino_followups.sh --partition=gpus --constraint='l40s|l40|rtx_a6000'
+```
+
+Repeat only promising settings with the second training seed, for example:
+
+```bash
+SEED=123 EXPERIMENT=global-crop bash submit_dino_followups.sh --constraint=l40s
+```
+
+The full experiment names above, plus `baseline`, are accepted by `EXPERIMENT`.
+`all` is the default and deliberately omits another baseline training run.
+`SPLIT_DIR` defaults to `data/holdout-v1`.
+
+### Probe outputs and comparison rules
+
+The jobs retain the existing official ridge implementation and support/query
+protocol: SSL sees 6,001 training images, the ridge probe sees their 601 labelled
+examples, and the monitoring query set has 149 labelled unseen images. Query
+labels never fit the ridge weights, standardization, or regularization strength.
+All SSL datasets expose only images to the training objective.
+
+* `holdout/final_accuracy` is the primary comparison, at epoch 500.
+* `holdout/final_macro_accuracy` and `holdout/domain/{galaxy,natural,satellite}_accuracy`
+  diagnose which distinctions changed. Domain class groups are manually inferred
+  from inspected examples, **not official domain metadata**. They are never used
+  to alter SSL sampling, losses, or the official classifier.
+* `holdout/best_accuracy` remains available for exploration; it is not the primary
+  score after repeatedly checking the same small validation set.
+* At the final epoch only, ten fixed draws of five support images per class fit
+  separate ridge probes and classify the same held-out queries. These log
+  `holdout/low_shot_5/accuracy_mean`, `accuracy_std`, and `macro_accuracy_mean`.
+  The diagnostic sampling seed is **2026**, independent of training seed. The
+  standard deviation measures support-draw variability, not a confidence interval.
+* `probe-history.jsonl` saves monitoring reports. `probe-final.json` includes final
+  per-class/domain results and low-support draw indices. `probe-final-embeddings.npz`
+  caches support/query features when final low-support probing is enabled.
+* `model.onnx` is the final teacher; `best.onnx` is the monitoring peak. Compare
+  like with like and preserve file hashes when downloading/submitting.
+
+One query image is 0.67 percentage points. Require replication across seeds and
+inspect domain tradeoffs before promoting small gains. Low-support diagnostics
+still use familiar classes; **they do not establish transfer to unseen classes**.
+Full-data LOO, image-held-out accuracy, and online challenge scores are different
+protocols and must not be ranked as if interchangeable.
+
+Old baseline checkpoints need not be retrained just to obtain the new diagnostics.
+For example, on Oscar evaluate the existing seed-42 holdout final model:
+
+```bash
+.venv/bin/python diagnose.py runs/dino-resnet-9113501/model.onnx \
+  --data data/holdout-v1/holdout.parquet \
+  --support-data data/holdout-v1/train.parquet \
+  --low-shot 5 --repeats 10 --seed 2026 --threads 4 \
+  --save-embeddings --out runs/diagnostics-holdout-9113501
+```
+
+The matching seed-123 baseline is job `9124171`. Replace both job IDs in that
+command to produce its report. Run on an allocated CPU node; no GPU is required.
+Standalone diagnostics without `--support-data` retain reference LOO. Optional
+low-support diagnostics on a single file exclude sampled support rows from that
+repeat's query set, but do not imply those images were excluded from SSL training.
+
+After selecting a candidate, check split sensitivity with fresh baseline and
+candidate training on a second fixed split, **not another sweep**:
+
+```bash
+.venv/bin/python prepare_holdout.py --seed 2027 --out data/holdout-confirm
+SPLIT_DIR=data/holdout-confirm EXPERIMENT=baseline \
+  bash submit_dino_followups.sh --constraint=l40s
+SPLIT_DIR=data/holdout-confirm EXPERIMENT=global-crop \
+  bash submit_dino_followups.sh --constraint=l40s
+```
+
+Replace `global-crop` with the selected winner. This is a split-sensitivity check,
+not a wholly independent untouched test set: it is drawn from the same original
+dataset and can overlap the first split. Keep its seed fixed and do not tune on
+it repeatedly. Train the eventual chosen recipe on all 7,500 images before
+submitting a full-data model. The holdout-trained model is a diagnostic candidate.
+
+New CLI flags are `--global-crop-min`, `--blur-sigma-max`, `--koleo-weight`,
+`--probe-low-shot`, `--probe-repeats`, and `--probe-seed`. Resuming restores saved
+augmentation/KoLeo settings and rejects conflicting explicit training flags.
+These experiment changes require fresh runs.
+New checkpoints also save and restore local crop count. Legacy checkpoints lack
+that field, so supply their original `--local-crops` explicitly when resuming.
+
 This experiment uses stable-pretraining 0.1.8's DINO method, loss, EMA teacher
 callback, and training loop. New runs default to a randomly initialized compact
 ResNet-18 (`--backbone resnet18_small`). It uses two residual blocks per stage,

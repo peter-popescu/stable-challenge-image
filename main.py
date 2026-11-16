@@ -23,6 +23,7 @@ from submission import export_teacher
 from training_data import DEFAULT_PATH, load_training_data
 
 DEFAULT_AUGMENTATION = {
+    "global_crop_min": 0.4, "blur_sigma_max": 2.0,
     "local_crop_min": 0.05, "local_crop_max": 0.4,
     "color_jitter_strength": 1.0, "solarize_probability": 0.2,
     "rotate90_probability": 0.0,
@@ -46,14 +47,14 @@ class RandomRightAngleRotation:
 
 def crop_transform(size, scale, blur_probability, solarize=False,
                    color_jitter_strength=1.0, solarize_probability=0.2,
-                   rotate90_probability=0.0):
+                   rotate90_probability=0.0, blur_sigma_max=2.0):
     operations = [
         T.RandomResizedCrop(size, scale=scale, interpolation=T.InterpolationMode.BICUBIC),
         T.RandomHorizontalFlip(),
         T.RandomApply([T.ColorJitter(*(value * color_jitter_strength
                                      for value in (0.4, 0.4, 0.2, 0.1)))], p=0.8),
         T.RandomGrayscale(p=0.2),
-        T.RandomApply([T.GaussianBlur(9, sigma=(0.1, 2.0))], p=blur_probability),
+        T.RandomApply([T.GaussianBlur(9, sigma=(0.1, blur_sigma_max))], p=blur_probability),
     ]
     # Omit the transform entirely when disabled: preserve the original RNG
     # sequence as well as the images for all pre-existing experiments.
@@ -73,16 +74,19 @@ class DINOCrops(Dataset):
         if limit is not None:
             self.images = self.images.select(range(min(limit, len(self.images))))
         self.global_transforms = [
-            crop_transform(96, (0.4, 1.0), 1.0,
+            crop_transform(96, (augmentation["global_crop_min"], 1.0), 1.0,
+                           blur_sigma_max=augmentation["blur_sigma_max"],
                            color_jitter_strength=augmentation["color_jitter_strength"],
                            rotate90_probability=augmentation["rotate90_probability"]),
-            crop_transform(96, (0.4, 1.0), 0.1, solarize=True,
+            crop_transform(96, (augmentation["global_crop_min"], 1.0), 0.1, solarize=True,
+                           blur_sigma_max=augmentation["blur_sigma_max"],
                            color_jitter_strength=augmentation["color_jitter_strength"],
                            solarize_probability=augmentation["solarize_probability"],
                            rotate90_probability=augmentation["rotate90_probability"]),
         ]
         self.local_transform = crop_transform(
             48, (augmentation["local_crop_min"], augmentation["local_crop_max"]), 0.5,
+            blur_sigma_max=augmentation["blur_sigma_max"],
             color_jitter_strength=augmentation["color_jitter_strength"],
             rotate90_probability=augmentation["rotate90_probability"])
         self.local_crops = local_crops
@@ -138,6 +142,24 @@ class NormalizedPrototypes(torch.nn.Linear):
         return torch.nn.functional.linear(x, torch.nn.functional.normalize(self.weight, dim=1))
 
 
+def koleo_loss(features):
+    """Nearest-neighbour entropy regularizer on one global view, in float32.
+
+    Different crops of the same image must not enter the neighbour search.
+    The input is the student's encoder output, before the DINO projection head.
+    """
+    if len(features) < 2:
+        raise ValueError("KoLeo requires at least two different images per batch")
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        features = torch.nn.functional.normalize(features.float(), dim=-1, eps=1e-8)
+        with torch.no_grad():
+            similarities = features @ features.T
+            similarities.fill_diagonal_(float("-inf"))
+            neighbours = similarities.argmax(dim=1)
+        distances = (features - features[neighbours]).norm(dim=1)
+        return -distances.clamp_min(1e-8).log().mean()
+
+
 class CNNTeacherStudentWrapper(spt.TeacherStudentWrapper):
     """Average floating state, but copy integer BatchNorm counters exactly."""
 
@@ -156,7 +178,10 @@ class ChallengeDINO(DINO):
     def __init__(self, epochs=100, lr=5e-4, weight_decay=0.04, n_prototypes=4096,
                  normalize_prototypes=False, freeze_last_layer_epochs=0,
                  backbone="vit_tiny", schedule_epochs=None, teacher_momentum=0.996,
-                 augmentation=None, optimizer="adamw", sgd_momentum=0.9):
+                 augmentation=None, optimizer="adamw", sgd_momentum=0.9,
+                 koleo_weight=0.0, local_crops=None):
+        if not 0 <= koleo_weight < float("inf"):
+            raise ValueError("koleo_weight must be finite and nonnegative")
         if optimizer not in ("adamw", "sgd"):
             raise ValueError("optimizer must be adamw or sgd")
         if not 0 <= sgd_momentum < 1:
@@ -203,6 +228,8 @@ class ChallengeDINO(DINO):
             "schedule_epochs": schedule_epochs, "teacher_momentum": teacher_momentum,
             "augmentation": {**DEFAULT_AUGMENTATION, **(augmentation or {})},
             "optimizer": optimizer, "sgd_momentum": sgd_momentum,
+            "koleo_weight": koleo_weight,
+            "local_crops": local_crops,
         })
         # Defaults retain older checkpoint semantics; new runs enable both below.
         if normalize_prototypes:
@@ -235,16 +262,40 @@ class ChallengeDINO(DINO):
         }
 
     def forward(self, batch, stage="fit"):
-        output = super().forward(
-            global_views=batch["global_views"], local_views=batch["local_views"]
-        )
+        # Capture the existing global student pass, avoiding an extra forward
+        # that would change BatchNorm statistics. The disabled path is unchanged.
+        captured = []
+        handle = None
+        if self.hparams.koleo_weight:
+            def capture(module, inputs, features):
+                if not captured:
+                    captured.append(features)
+            handle = self.backbone.student.register_forward_hook(capture)
+        try:
+            output = super().forward(
+                global_views=batch["global_views"], local_views=batch["local_views"]
+            )
+        finally:
+            if handle is not None:
+                handle.remove()
+        loss = output.loss
+        if self.hparams.koleo_weight:
+            features = captured[0]
+            if features.ndim == 3:
+                features = features[:, 0]
+            regularizer = koleo_loss(features[:batch["global_views"][0].shape[0]])
+            loss = loss + self.hparams.koleo_weight * regularizer
+            self.log("train/dino_loss", output.loss, on_step=False, on_epoch=True,
+                     batch_size=batch["global_views"][0].shape[0])
+            self.log("train/koleo_loss", regularizer, on_step=False, on_epoch=True,
+                     batch_size=batch["global_views"][0].shape[0])
         # Finish the queued center update so every checkpoint has current state.
         self.dino_loss.apply_center_update()
-        if not torch.isfinite(output.loss):
+        if not torch.isfinite(loss):
             raise FloatingPointError("DINO loss became non-finite")
-        self.log("train/loss", output.loss, on_step=True, on_epoch=True,
+        self.log("train/loss", loss, on_step=True, on_epoch=True,
                  prog_bar=True, batch_size=batch["global_views"][0].shape[0])
-        return {"loss": output.loss, "embedding": output.embedding}
+        return {"loss": loss, "embedding": output.embedding}
 
     def after_manual_backward(self):
         # stable-pretraining calls this before clipping and optimizer.step().
@@ -266,7 +317,14 @@ def parse_args():
                         help="Initial encoder and head EMA momentum for new runs (default: 0.996)")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--local-crops", type=int, default=6)
+    parser.add_argument("--local-crops", type=int,
+                        help="Local views (default: 6 for new runs; restored on resume)")
+    parser.add_argument("--global-crop-min", type=float,
+                        help="Minimum global-crop area fraction (default: 0.4)")
+    parser.add_argument("--blur-sigma-max", type=float,
+                        help="Maximum blur sigma on all views (default: 2.0)")
+    parser.add_argument("--koleo-weight", type=float,
+                        help="Encoder KoLeo regularization weight (default: 0, disabled)")
     parser.add_argument("--local-crop-min", type=float,
                         help="Minimum local-crop area fraction (default: 0.05)")
     parser.add_argument("--local-crop-max", type=float,
@@ -291,6 +349,11 @@ def parse_args():
                         help="Monitoring images/labels (default: training data)")
     parser.add_argument("--probe-support-data", type=Path,
                         help="Fit the diagnostic ridge probe on this separate file; log holdout metrics")
+    parser.add_argument("--probe-low-shot", type=int, default=0,
+                        help="At the final epoch, also fit probes with K support images/class; 0 disables")
+    parser.add_argument("--probe-repeats", type=int, default=10)
+    parser.add_argument("--probe-seed", type=int, default=2026,
+                        help="Fixed diagnostic support sampling seed; independent of training seed")
     parser.add_argument("--accelerator", choices=["auto", "cpu", "gpu", "mps"], default="auto")
     parser.add_argument("--precision", default="32-true")
     parser.add_argument("--wandb", action="store_true", help="Log metrics and configuration to Weights & Biases")
@@ -305,7 +368,8 @@ def parse_args():
                         help="Export-only feature selection; multiscale concatenates compact ResNet stages 2–4")
     parser.add_argument("--smoke-test", action="store_true", help="Two small CPU training steps, checkpoint, and ONNX export")
     args = parser.parse_args()
-    if args.epochs < 1 or args.batch_size < 1 or args.workers < 0 or args.local_crops < 0 or args.lr <= 0:
+    if (args.epochs < 1 or args.batch_size < 1 or args.workers < 0
+            or (args.local_crops is not None and args.local_crops < 0) or args.lr <= 0):
         parser.error("epochs, batch-size and lr must be positive; workers and local-crops nonnegative")
     if args.resume and args.export_checkpoint:
         parser.error("choose either --resume or --export-checkpoint")
@@ -315,6 +379,14 @@ def parse_args():
         parser.error("weight-decay must be finite and nonnegative")
     if args.probe_every < 0:
         parser.error("probe-every must be nonnegative")
+    if args.probe_low_shot < 0 or args.probe_repeats < 1:
+        parser.error("probe-low-shot must be nonnegative and probe-repeats positive")
+    if args.probe_low_shot and (not args.probe_every or not args.probe_support_data):
+        parser.error("probe-low-shot requires enabled probing and separate support/query data")
+    if args.koleo_weight is not None and not 0 <= args.koleo_weight < float("inf"):
+        parser.error("koleo-weight must be finite and nonnegative")
+    if args.koleo_weight and args.batch_size < 2:
+        parser.error("KoLeo requires batch-size >= 2")
     if args.schedule_epochs is not None and args.schedule_epochs < args.epochs:
         parser.error("schedule-epochs must be at least epochs")
     if args.teacher_momentum is not None and not 0 < args.teacher_momentum < 1:
@@ -326,6 +398,10 @@ def parse_args():
             parser.error("sgd-momentum requires optimizer sgd")
     augmentation = {key: getattr(args, key) if getattr(args, key) is not None else default
                     for key, default in DEFAULT_AUGMENTATION.items()}
+    if not 0 < augmentation["global_crop_min"] <= 1:
+        parser.error("global-crop-min must be between 0 and 1")
+    if not 0.1 < augmentation["blur_sigma_max"] < float("inf"):
+        parser.error("blur-sigma-max must be finite and greater than 0.1")
     for key in ("local_crop_min", "local_crop_max"):
         if getattr(args, key) is not None and not 0 < getattr(args, key) <= 1:
             parser.error("local-crop fractions must be between 0 and 1")
@@ -351,19 +427,34 @@ def main():
         model = ChallengeDINO.load_from_checkpoint(str(args.export_checkpoint), map_location="cpu")
         export_teacher(model, args.output / "model.onnx", features=args.export_features)
         return
+    requested_local_crops = args.local_crops
+    args.local_crops = 6 if args.local_crops is None else args.local_crops
     if args.smoke_test:
         args.accelerator, args.precision = "cpu", "32-true"
-        args.batch_size, args.workers, args.local_crops = 2, 0, 2
+        args.batch_size, args.workers = 2, 0
+        args.local_crops = min(args.local_crops, 2)
         torch.set_num_threads(2)
     augmentation = {key: getattr(args, key) if getattr(args, key) is not None else default
                     for key, default in DEFAULT_AUGMENTATION.items()}
     model = None
     if args.resume:
         model = ChallengeDINO.load_from_checkpoint(str(args.resume), map_location="cpu")
+        saved_local_crops = model.hparams.local_crops
+        if saved_local_crops is not None:
+            if requested_local_crops is not None and requested_local_crops != saved_local_crops:
+                raise ValueError("--local-crops must match the resumed checkpoint")
+            args.local_crops = saved_local_crops
+        else:
+            # Legacy checkpoints did not record this; retain explicit CLI values.
+            model.hparams.local_crops = args.local_crops
         if args.backbone is not None and args.backbone != model.hparams.backbone:
             raise ValueError("--backbone must match the resumed checkpoint")
         if args.optimizer is not None and args.optimizer != model.hparams.optimizer:
             raise ValueError("--optimizer must match the resumed checkpoint; optimizer changes require a fresh run")
+        if args.koleo_weight is not None and args.koleo_weight != model.hparams.koleo_weight:
+            raise ValueError("--koleo-weight must match the resumed checkpoint")
+        if model.hparams.koleo_weight and args.batch_size < 2:
+            raise ValueError("KoLeo requires batch-size >= 2")
         if args.sgd_momentum is not None:
             if model.hparams.optimizer != "sgd" or args.sgd_momentum != model.hparams.sgd_momentum:
                 raise ValueError("--sgd-momentum must match the resumed SGD checkpoint")
@@ -389,6 +480,8 @@ def main():
                               schedule_epochs=args.schedule_epochs,
                               augmentation=augmentation,
                               optimizer=args.optimizer or "adamw",
+                              koleo_weight=args.koleo_weight or 0.0,
+                              local_crops=args.local_crops,
                               sgd_momentum=args.sgd_momentum if args.sgd_momentum is not None else 0.9,
                               teacher_momentum=args.teacher_momentum if args.teacher_momentum is not None else 0.996,
                               backbone=args.backbone or "resnet18_small")
@@ -400,7 +493,9 @@ def main():
         callbacks.append(ChallengeProbe(args.probe_data or args.data,
                                        every_n_epochs=args.probe_every,
                                        support_data=args.probe_support_data,
-                                       output_dir=args.output))
+                                       output_dir=args.output,
+                                       low_shot=args.probe_low_shot,
+                                       repeats=args.probe_repeats, seed=args.probe_seed))
     callbacks.append(checkpoint)
     loggers = [CSVLogger(str(args.output), name="logs")]
     wandb_logger = None
@@ -417,6 +512,7 @@ def main():
                 "schedule_epochs": model.hparams.schedule_epochs or args.epochs,
                 "teacher_momentum": model.hparams.teacher_momentum,
                 "optimizer": model.hparams.optimizer,
+                "koleo_weight": model.hparams.koleo_weight,
                 "sgd_momentum": model.hparams.sgd_momentum if model.hparams.optimizer == "sgd" else None,
                 **augmentation,
                 "batch_size": args.batch_size, "local_crops": args.local_crops,
@@ -424,6 +520,8 @@ def main():
                 "seed": args.seed, "precision": args.precision,
                 "smoke_test": args.smoke_test,
                 "probe_every": args.probe_every,
+                "probe_low_shot": args.probe_low_shot,
+                "probe_repeats": args.probe_repeats, "probe_seed": args.probe_seed,
                 "probe_protocol": "support_query" if args.probe_support_data else "onnx_cpu_ridge_loo",
                 "training_data": str(args.data),
                 "probe_data": str(args.probe_data or args.data),

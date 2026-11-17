@@ -66,6 +66,8 @@ def parse_args():
     p.add_argument("--dec-heads", type=int, default=8)
     # How an image's tokens become one embedding vector
     p.add_argument("--pool", choices=["mean", "cls", "cls+mean"], default="mean")
+    p.add_argument("--feature-layers", default="",
+                   help="comma-separated block numbers to pool and concatenate, e.g. 7,8,9 (default: final output)")
     # Plumbing
     p.add_argument("--probe-every", type=int, default=10)
     p.add_argument("--workers", type=int, default=4)
@@ -116,21 +118,48 @@ def normalise(images_uint8):
 # Model
 # ---------------------------------------------------------------------------------------------------
 
-class Encoder(nn.Module):
-    """What we submit: the ViT (no masking at test time) followed by pooling into one vector."""
+def pool_tokens(tokens, pool):
+    """[B, 1 + num_patches, D] tokens -> one vector per image."""
+    cls, patches = tokens[:, 0], tokens[:, 1:]
+    if pool == "cls":
+        return cls
+    if pool == "mean":
+        return patches.mean(1)
+    return torch.cat([cls, patches.mean(1)], dim=1)
 
-    def __init__(self, vit, pool="mean"):
+
+def block_outputs(vit, x):
+    """Tokens after every transformer block (before the final LayerNorm), as a list of length depth."""
+    x = vit.patch_embed(x)
+    x = vit._pos_embed(x)  # prepend CLS token, add positional embedding
+    x = vit.norm_pre(vit.patch_drop(x))
+    outs = []
+    for blk in vit.blocks:
+        x = blk(x)
+        outs.append(x)
+    return outs
+
+
+class Encoder(nn.Module):
+    """What we submit: the ViT (no masking at test time) followed by pooling into one vector.
+
+    layers=() uses the final output (after the last block and LayerNorm). layers=(7, 8, 9) instead pools
+    the outputs of blocks 7, 8 and 9 (1-indexed) separately and concatenates them.
+    """
+
+    def __init__(self, vit, pool="mean", layers=()):
         super().__init__()
-        self.vit, self.pool = vit, pool
+        self.vit, self.pool, self.layers = vit, pool, tuple(layers)
 
     def forward(self, x):
-        tokens = self.vit.forward_features(x)  # [B, 1 + 144, D]: CLS token, then one token per patch
-        cls, patches = tokens[:, 0], tokens[:, 1:]
-        if self.pool == "cls":
-            return cls
-        if self.pool == "mean":
-            return patches.mean(1)
-        return torch.cat([cls, patches.mean(1)], dim=1)
+        if not self.layers:
+            return pool_tokens(self.vit.forward_features(x), self.pool)  # [B, 1 + 144, D]
+        outs = block_outputs(self.vit, x)
+        return torch.cat([pool_tokens(outs[i - 1], self.pool) for i in self.layers], dim=1)
+
+
+def parse_layers(text):
+    return tuple(int(i) for i in text.split(",") if i.strip())
 
 
 def build_mae(a):
@@ -210,7 +239,7 @@ def main():
 
     mae, vit = build_mae(a)
     mae.to(device)
-    encoder = Encoder(vit, a.pool)
+    encoder = Encoder(vit, a.pool, parse_layers(a.feature_layers))
     n_enc = sum(p.numel() for p in vit.parameters())
     n_dec = sum(p.numel() for p in mae.parameters()) - n_enc
     print(f"encoder {n_enc / 1e6:.2f}M params (~{n_enc * 4 / 2**20:.1f} MiB in ONNX), decoder {n_dec / 1e6:.2f}M")

@@ -92,6 +92,16 @@ def file_hash(path):
     return h.hexdigest()
 
 
+def probe_embeddings(embeddings, labels, folds, n_splits=5):
+    """One common official probe path for ONNX and cached frozen readouts."""
+    from evaluate import Ridge
+    metrics, fold_results, predictions, confusion = evaluate_folds(embeddings, labels, folds, n_splits)
+    official = Ridge().fit(embeddings, labels)
+    metrics['official_local_loo_accuracy'] = float(np.mean(official.loo_pred == labels))
+    metrics['official_local_ridge_lambda'] = float(official.lam)
+    return metrics, fold_results, predictions, official.loo_pred, confusion
+
+
 def main():
     p = argparse.ArgumentParser(__doc__)
     p.add_argument('--model', required=True, type=Path)
@@ -133,12 +143,9 @@ def main():
     del images
     results, records, predictions, official_predictions = {}, [], {}, {}
     for name, embeddings in features.items():
-        metrics, fold_results, pred, confusion = evaluate_folds(embeddings, labels, folds, a.n_splits)
-        official = Ridge().fit(embeddings, labels)
-        metrics['official_local_loo_accuracy'] = float(np.mean(official.loo_pred == labels))
-        metrics['official_local_ridge_lambda'] = float(official.lam)
+        metrics, fold_results, pred, loo_pred, confusion = probe_embeddings(embeddings, labels, folds, a.n_splits)
         results[name] = {'metrics': metrics, 'folds': fold_results}
-        predictions[name], official_predictions[name] = pred, official.loo_pred
+        predictions[name], official_predictions[name] = pred, loo_pred
         records += [{'representation': name, **r} for r in fold_results]
         np.save(a.output / f'{name}_outer_confusion.npy', confusion)
         print(name, json.dumps({k:v for k,v in metrics.items() if k != 'per_class'}), flush=True)

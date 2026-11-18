@@ -15,6 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from .data import Views
+from .augmentation_policy import augmentation_metadata
 from .model import make_method
 from stable_pretraining.registry import RegistryLogger
 
@@ -110,7 +111,8 @@ def main():
     with a.data.open('rb') as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b''):
             digest.update(chunk)
-    metadata = {'config': c, 'data': str(a.data.resolve()), 'data_sha256': digest.hexdigest(), 'dataset_size': len(dataset),
+    metadata = {'config': c, 'augmentation': augmentation_metadata(c),
+                'data': str(a.data.resolve()), 'data_sha256': digest.hexdigest(), 'dataset_size': len(dataset),
                 'python': platform.python_version(), 'torch': torch.__version__,
                 'packages': {d.metadata['Name']: d.version for d in importlib.metadata.distributions()},
                 'git': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -124,6 +126,9 @@ def main():
     callbacks = [EpochSeed(), LearningRateMonitor(logging_interval='step'),
                  ModelCheckpoint(dirpath=a.output / 'checkpoints', save_last=True,
                                  every_n_epochs=1, save_top_k=1, monitor=None)]
+    if c.get('resource_metrics', False):
+        from .resources import ResourceMetrics
+        callbacks.insert(1, ResourceMetrics(a.output))
     if a.retain_every:
         callbacks.append(RetainedCheckpoint(
             dirpath=a.output / 'checkpoints', filename='retained-epoch-{epoch:03d}-step-{step}',

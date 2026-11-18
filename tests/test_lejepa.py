@@ -73,7 +73,8 @@ def test_full_screening_batch_fits_cuda():
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
     torch.manual_seed(42)
-    config = json.loads(Path('experiments/lejepa/config.json').read_text())
+    config_path = Path(os.environ.get('LEJEPA_MEMORY_CONFIG', 'experiments/lejepa/config.json'))
+    config = json.loads(config_path.read_text())
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     model = make_method(config).cuda().train()
@@ -93,6 +94,8 @@ def test_full_screening_batch_fits_cuda():
           f"reserved {torch.cuda.max_memory_reserved()/1024**3:.2f} GiB", flush=True)
     if os.environ.get('EXPERIMENT_STORAGE'):
         report = {'gpu': torch.cuda.get_device_name(), 'batch_size': config['batch_size'],
+                  'config': str(config_path), 'global_views': config['global_views'],
+                  'local_views': config['local_views'], 'local_size': config['local_size'],
                   'total_vram_gib': torch.cuda.get_device_properties(0).total_memory / 1024**3,
                   'peak_allocated_gib': torch.cuda.max_memory_allocated() / 1024**3,
                   'peak_reserved_gib': torch.cuda.max_memory_reserved() / 1024**3}

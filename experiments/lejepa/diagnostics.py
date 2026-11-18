@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw
 import torch
 from training_data import load_training_data
 from .data import preprocessing
-from .model import Encoder, load_encoder
+from .model import make_encoder, load_encoder
 
 
 def fit_pca(x):
@@ -37,6 +37,7 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--shared', action='store_true', help='Shared basis and scaling across images')
     p.add_argument('--indices', help='Comma separated row IDs; overrides random selection')
+    p.add_argument('--spatial-cache', type=Path, help='Reuse trained maps extracted once by the frozen pooling study')
     a = p.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(a.seed)
@@ -48,12 +49,24 @@ def main():
     x = torch.stack([preprocessing()(im) for im in images])
     trained = load_encoder(a.checkpoint)
     torch.manual_seed(a.seed)
-    untrained = Encoder().eval()
+    untrained = make_encoder(getattr(trained, 'experiment_config', {})).eval()
     with torch.no_grad():
         maps = []
         for model in [trained, untrained]:
-            maps.append(torch.cat([model.spatial(v) for v in x.split(2)]).permute(0, 2, 3, 1).numpy())
-        embeddings = torch.cat([trained(v) for v in x.split(2)]).numpy()
+            if model is trained and a.spatial_cache:
+                metadata = json.loads((a.spatial_cache/'cache.json').read_text())
+                from .sweep import digest
+                if metadata['checkpoint_sha256'] != digest(a.checkpoint) or metadata['data_sha256'] != digest(a.data):
+                    raise ValueError('Spatial cache belongs to another checkpoint/dataset')
+                lookup = {row:i for i,row in enumerate(metadata['row_ids'])}
+                cached = np.load(a.spatial_cache/'maps.npy', mmap_mode='r')
+                trained_maps = torch.from_numpy(np.stack([cached[lookup[row]] for row in ids]))
+            else:
+                features = torch.cat([model.spatial(v) for v in x.split(2)])
+                if model is trained:
+                    trained_maps = features
+            maps.append((trained_maps if model is trained else features).permute(0, 2, 3, 1).numpy())
+        embeddings = trained.aggregate(trained_maps).numpy()
     a.output.mkdir(parents=True, exist_ok=True)
     report = {'indices': ids, 'seed': a.seed, 'shared': a.shared, 'explained_variance': {}}
     panels = [[im] for im in images]

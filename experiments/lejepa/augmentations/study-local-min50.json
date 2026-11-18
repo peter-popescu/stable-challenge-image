@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "milestones": [
+    50,
+    100,
+    150,
+    200
+  ],
+  "pca_count": 12,
+  "invariance_count": 128,
+  "diagnostic_seed": 42,
+  "runs": [
+    {
+      "name": "control",
+      "config": "experiments/lejepa/augmentations/control.json"
+    },
+    {
+      "name": "local-min50",
+      "config": "experiments/lejepa/augmentations/local-min50.json"
+    }
+  ],
+  "control": {
+    "screen": "experiment_outputs/sweeps/lejepa-lr-sigreg-seed42/lr-0.003_lambda-0.005",
+    "continued": "experiment_outputs/sweeps/lejepa-lr-sigreg-seed42/continued-200/lr-0.003_lambda-0.005"
+  }
+}

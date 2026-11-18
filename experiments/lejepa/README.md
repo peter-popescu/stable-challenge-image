@@ -1,6 +1,28 @@
 LeJEPA + ResNet-9 baseline
 =========================
 
+The completed [next round](next_round/LAUNCH.md) covers longer ResNet9/ResNet18
+training, six-local-view training, frozen multiscale and multi-encoder readouts,
+and DTD/CIFAR-100/[lightweight CLEVR](next_round/CLEVR_LIGHT.md) probes.
+The [consolidated results](../../experiment_outputs/next-round/FINAL_REPORT.md)
+and external matrices are generated artifacts under `experiment_outputs/` and
+remain excluded from Git. External datasets and caches use the repository's
+shared-storage symlinks; checkpoints and submission files are also excluded.
+
+The [ResNet18 and frozen pooling study](architecture/EXPERIMENTS.md) matches the
+teammate's width40 BasicBlock backbone with GAP320 and export-only padding,
+and compares six parameter-free readouts on four frozen ResNet9 checkpoints.
+It records architecture/resource preflight, reproducible launches and reports.
+
+The prepared [augmentation ablation proposal](augmentations/PROPOSAL.md) documents
+the exact current policy, pinned reference comparisons, primary local-min10 and
+jitter-strong interventions, optional local-min50/more-views specs, actual control
+LR-history verification, resource estimates, and one-allocation launch commands.
+The primary pair is submitted as replacement job180196; optional follow-ups remain
+unsubmitted. Job180053 stopped before training on temporary-file cleanup. A short
+2080 Ti fit test passed, so the replacement accepts 2080 Ti, TITAN RTX, RTX A6000,
+L40 or L40S with batch128 and FP32 unchanged.
+
 Run commands from the repository root. Training, sweeps, seed repeats and
 checkpoint evaluations have been exercised through Brown CS Hydra Slurm.
 This implementation targets the existing lockfile: stable-pretraining 0.1.8,
@@ -198,6 +220,29 @@ by the user, not by these scripts.
 
 Live training dashboard
 -----------------------
+
+Job180196 also has a separate SPT telemetry run, `gpu-memory-job-180196`,
+under `experiment_outputs/telemetry/`. It plots allocated-device VRAM used/free,
+total capacity, memory percentage and GPU utilization every10 seconds. The x-axis
+step is elapsed wall seconds since monitoring started. Select this run in SPT
+or filter metrics by `gpu_memory`. The collector is
+`monitoring/gpu_memory.py`, running as overlapping step180196.1 inside the existing
+allocation, without importing Torch or editing the frozen training pipeline.
+These are sampled nvidia-smi device measurements, not PyTorch allocated/reserved
+values or guaranteed transient peaks. Earlier memory history cannot be recovered.
+
+For a future existing GPU allocation, start one monitor with a fresh output path:
+
+```bash
+srun --jobid=JOB_ID --overlap --exact --nodes=1 --ntasks=1 \
+  --cpus-per-task=1 --gres=gpu:1 --immediate=10 \
+  .venv/bin/python -u monitoring/gpu_memory.py \
+  --output experiment_outputs/telemetry/gpu-memory-job-JOB_ID --interval 10
+```
+
+The collector refuses multiple GPUs and duplicate CSV writers. It exits with the
+allocation; a terminated monitor retains its recorded history. A low usage trace
+during checkpoint CPU evaluation is expected.
 
 New training runs use stable-pretraining's RegistryLogger. The run directory
 `<output>/metrics/` contains metrics.csv, sidecar.json, summary.json and heartbeat.
@@ -568,3 +613,9 @@ experiment_outputs/validation/stratified-5fold-seed42.json --output DIRECTORY`.
 Run it through report_slurm.sh with
 LEJEPA_ANALYSIS_MODULE=experiments.lejepa.checkpoint_eval in a CPU allocation.
 Optional --compare-duration-root adds the documented duration comparison.
+
+The statistical-pooling training and broader frozen evaluation suite are documented
+in [downstream/PROTOCOL.md](downstream/PROTOCOL.md), with jobs, preflight results and
+monitoring in [downstream/LAUNCH.md](downstream/LAUNCH.md). The incremental report is
+`experiment_outputs/green-area/downstream/REPORT.md`. External evaluation data and
+probe weights remain isolated under `experiment_outputs/external-eval/`.

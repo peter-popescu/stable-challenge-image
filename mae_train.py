@@ -67,6 +67,9 @@ def parse_args():
     p.add_argument("--crop-min", type=float, default=0.2, help="smallest RandomResizedCrop area fraction")
     p.add_argument("--jitter", type=float, default=0.0, help="probability of colour jitter (0.4, 0.4, 0.2, 0.1)")
     p.add_argument("--gray", type=float, default=0.0, help="probability of converting a view to grayscale")
+    p.add_argument("--rot90", type=float, default=0.0,
+                   help="probability of rotating a view by 90, 180 or 270 degrees (with the horizontal flip this "
+                        "covers all 8 square symmetries; suits galaxies and satellite tiles, which have no 'up')")
     # MAE
     p.add_argument("--mask-ratio", type=float, default=0.75)
     p.add_argument("--no-norm-pix", action="store_true", help="reconstruct raw pixels instead of per-patch normalised ones")
@@ -111,16 +114,32 @@ def load_images(path):
     return torch.from_numpy(x).permute(0, 3, 1, 2).contiguous(), np.asarray(ds["label"])
 
 
-class Augmented(Dataset):
-    """Training view(s) of one image: random crop (resized back to 96) + horizontal flip, optional colour
-    jitter / grayscale, then normalise. With views > 1 it returns a tuple of independently augmented views."""
+class RandomRot90(nn.Module):
+    """With probability p, rotate a square image by a random multiple of 90 degrees (90, 180 or 270)."""
 
-    def __init__(self, images, crop_min, views=1, jitter=0.0, gray=0.0):
+    def __init__(self, p):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        if torch.rand(()) < self.p:
+            x = torch.rot90(x, int(torch.randint(1, 4, ())), dims=(-2, -1))
+        return x
+
+
+class Augmented(Dataset):
+    """Training view(s) of one image: random crop (resized back to 96) + horizontal flip, optional 90-degree
+    rotation, colour jitter and grayscale, then normalise. With views > 1 it returns a tuple of independently
+    augmented views."""
+
+    def __init__(self, images, crop_min, views=1, jitter=0.0, gray=0.0, rot90=0.0):
         self.images, self.views = images, views
         tfs = [
             v2.RandomResizedCrop(96, scale=(crop_min, 1.0), interpolation=v2.InterpolationMode.BICUBIC, antialias=True),
             v2.RandomHorizontalFlip(),
         ]
+        if rot90 > 0:
+            tfs.append(RandomRot90(rot90))
         if jitter > 0:
             tfs.append(v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=jitter))
         if gray > 0:
@@ -284,7 +303,7 @@ def main():
 
     hybrid = a.sigreg_weight > 0
     loader = DataLoader(
-        Augmented(images, a.crop_min, a.views if hybrid else 1, a.jitter, a.gray), batch_size=a.batch_size, shuffle=True, drop_last=True,
+        Augmented(images, a.crop_min, a.views if hybrid else 1, a.jitter, a.gray, a.rot90), batch_size=a.batch_size, shuffle=True, drop_last=True,
         num_workers=a.workers, persistent_workers=a.workers > 0, pin_memory=device.type == "cuda",
         generator=torch.Generator().manual_seed(a.seed),
     )
